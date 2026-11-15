@@ -1,0 +1,7 @@
+.{
+    .name = .zqueel_fs,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0xb87e98220f14394b,
+}

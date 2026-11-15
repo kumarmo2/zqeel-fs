@@ -1,0 +1,124 @@
+# Project status and continuation notes
+
+## Goal and confirmed decisions
+
+- Build a production-grade SQLite-backed filesystem primarily for production agents.
+- Implementation language/toolchain: Zig 0.17; database access through SQLite's C library.
+- Expose both an embedded API and a mountable filesystem.
+- Separate inode identity, directory names, and file contents.
+- Store contents in logical chunks, not one growing BLOB per file.
+- Target POSIX metadata: file type/permissions, ownership, link counts, size, and timestamps.
+- Begin external filesystem semantic testing with pjdfstest.
+- Work on this machine for now; the user has no isolated environment.
+- User requested a working mount for ordinary Linux file and directory commands, using libfuse3.
+- Initial scope is basic shell operations with unsupported POSIX features reported explicitly.
+- Formatting is a separate explicit command and must not overwrite existing databases.
+
+## Current repository state
+
+- `schema.sql` defines four application tables and the reverse directory-entry index.
+- `inodes`: object identity and stat-like metadata; AUTOINCREMENT also creates SQLite's internal `sqlite_sequence` table.
+- `dirents`: unique byte-oriented names within a parent directory, pointing to inodes.
+- `file_chunks`: sparse, logically indexed content chunks with potentially short payloads.
+- `fs_meta`: at most one row recording format version, root inode, and chunk size.
+- `AGENTS.md` provides entry-point instructions for subsequent agents.
+- `src/main.zig` implements `zqueel-fs format <new-database>` only; `src/ffi.h` exposes SQLite/POSIX APIs through Zig translate-c.
+- The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
+- Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
+- `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
+- **Incomplete:** mounting, FUSE callbacks, embedded filesystem API, filesystem operations, migrations, persistent tests, and cleanup runner are not implemented.
+
+## Proposed v1 details still subject to review
+
+The schema records a concrete proposal, not approval of all operation semantics.
+
+- Initial on-disk object types: regular files and directories only.
+- Inode IDs are positive application-assigned/SQLite-generated identities; AUTOINCREMENT avoids reusing committed IDs.
+- Filename values are BLOBs, compared byte-for-byte; empty names, slash, NUL, dot, and dot-dot are rejected.
+- Dot and dot-dot are synthesized/resolved rather than stored as directory-entry rows.
+- Multiple directory entries may reference a regular-file inode, leaving room for hard links; phase-1 hard-link support is not decided.
+- No cascaded deletes; final inode/content reclamation must be explicit.
+- Timestamps are signed integer nanoseconds since the Unix epoch; ctime is status-change time, not birth time.
+- Chunk size is persisted per database and must not change after formatting.
+- The initial formatter uses a 64 KiB chunk size; this implementation choice needs performance measurement.
+- A present chunk contains 1..chunk_size bytes; omitted suffix bytes and absent chunks read as zeros.
+- Logical file length comes from inodes.size, not the number or lengths of chunk rows.
+- STRICT tables require SQLite 3.37+; WITHOUT ROWID chunk storage uses SQL reads/updates, not sqlite3_blob_open.
+
+## Applying the schema safely
+
+For review/validation without creating a disk database:
+
+```sh
+sqlite3 -bail :memory: '.read schema.sql' 'PRAGMA integrity_check;' 'PRAGMA foreign_key_check;'
+```
+
+For an explicitly chosen NEW database only:
+
+```sh
+sqlite3 -bail filesystem.db < schema.sql
+```
+
+The script enables foreign keys before its DDL transaction. Every future SQLite connection must independently enable and verify foreign-key enforcement before transactions. Do not run the script inside an existing transaction. The script intentionally has no IF NOT EXISTS: existing tables should cause failure rather than conceal a schema mismatch.
+
+The SQL script alone creates tables only. The implemented `format` command initializes schema, directory root (nlink=2), and metadata row in one transaction. If formatting fails, the newly created path is retained for inspection; it is never automatically deleted.
+
+Journal mode, synchronous mode, busy handling, filesystem identity, and durability promises are not yet selected. Applying this DDL alone does not produce a usable or production-safe filesystem.
+
+## Invariants required in the implementation
+
+Enforce cross-row rules in the same transaction as the operation; foreign keys alone do not enforce them:
+
+1. Each directory-entry parent is a directory.
+2. Each non-root directory has exactly one parent; directories cannot be hard-linked or moved into their descendants.
+3. Root is a directory, resolves its own parent, and cannot be removed, replaced, or given an ordinary incoming directory entry.
+4. Only regular files own chunks; chunk payloads cannot exceed the configured chunk size.
+5. Chunk offsets/file lengths are checked for overflow and chunks do not retain data past EOF.
+6. Truncating removes later chunks and discards bytes past the new EOF in a retained tail, preventing stale-data exposure on extension.
+7. Missing chunks, short-chunk suffixes, and gaps created by writes beyond EOF read as zeros.
+8. Link counts track namespace mutations; directory counts follow the chosen POSIX directory convention, not a simple count of incoming dirents.
+9. Rename/replacement, contents, sizes, link counts, and relevant timestamps change atomically.
+10. Open handles keep unlinked inodes alive until final close; zero-link reclamation is explicit.
+11. Orphan recovery cannot reclaim objects still open through another active filesystem instance.
+12. A mounted/opened filesystem must have exactly one valid fs_meta row and a supported format version.
+
+## Unresolved choices before implementation
+
+- Approve or revise schema; choose chunk size and maximum file/name/path limits.
+- Settle phase-1 operations: core files/directories versus hard links, symlinks, and additional POSIX functionality.
+- Define path lookup, rename replacement, open/unlink lifetime, directory size reporting, and timestamp-update policy.
+- Decide how shared-core code exposes embedded operations and the libfuse3 mount adapter.
+- Decide whether multiple independent processes may directly open the same filesystem database; open-handle lifetime coordination depends on this.
+- Define permissions/credentials, umask, special bits, and enforcement responsibilities.
+- Define write/fsync/directory-fsync and embedded transaction durability guarantees; select SQLite journaling/synchronous policy accordingly.
+- Design bootstrap, shutdown, locking, interrupted-operation recovery, and schema version migrations.
+- Consider directory enumeration cookies, st_blocks reporting, and inode-ID mapping for the mount adapter.
+
+## Testing direction, deferred until operation design
+
+- pjdfstest first for POSIX semantics; many cases need root and supported features.
+- Maintain explicit passes/failures/unsupported cases; do not weaken tests to hide implementation errors.
+- Later: fsx/fsstress, selected xfstests, model-based API tests, concurrency, fault injection, and crash recovery.
+- SQLite integrity_check does not prove filesystem semantic consistency; foreign_key_check and filesystem invariants are separate checks.
+- Planned same-machine lifecycle: fresh database and mount per run, keep logs, preserve failed-run artifacts.
+- Cleanup must stop tests, unmount, verify unmounted, stop remaining filesystem processes, and only then remove verified owned paths.
+- Cleanup is repeatability, not a privileged-test security boundary; review tests and obtain authorization before elevated execution.
+
+## Validation log
+
+- Inspected the initial Zig sources/build files without modifying them.
+- Local tools report Zig 0.17.0 and sqlite3 CLI 3.54.0.
+- Executed `schema.sql` in an in-memory database using the SQLite CLI: integrity_check returned `ok`; foreign_key_check returned no violations.
+- Ran an ephemeral Python/SQLite in-memory smoke check: root/file metadata, a non-UTF-8 filename, and chunk content were accepted; all 24 invalid mutations were rejected.
+- Rejection checks covered invalid filename bytes/types, duplicate keys, missing foreign-key targets, invalid mode/owner/size/link-count/chunk metadata, and deletion of a referenced inode.
+- Verified the DDL leaves inodes/fs_meta empty for future atomic bootstrap; no on-disk database, mounts, privileged commands, or persistent test harness were used.
+- Built the partial formatter with `zig build` using Zig 0.17, SQLite, and libfuse3.
+- Formatted a temporary database, inspected root/metadata, checked integrity and foreign keys, and verified a second format refuses and leaves it unchanged.
+- No mount was performed. These checks do not validate filesystem semantics, durability, security against hostile pathname replacement, or cross-row invariants.
+
+## Suggested next work (only when requested)
+
+1. Implement the shared filesystem core and libfuse3 callbacks for basic file/directory operations; report unsupported operations explicitly.
+2. Define and implement inode handle lifetime, synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
+3. Obtain explicit authorization before mounting on this machine, then validate shell operations on a freshly created dedicated mount.
+4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.

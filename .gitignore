@@ -1,0 +1,4 @@
+.zig-cache
+temp-mount
+zig-out
+test.db
