@@ -5,12 +5,14 @@ const schema = @embedFile("schema.sql");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3 or !std.mem.eql(u8, args[1], "format")) {
-        std.debug.print("Usage: zqueel-fs format <new-database>\n", .{});
-        std.debug.print("Mounting is not implemented yet.\n", .{});
+    if (args.len == 3 and std.mem.eql(u8, args[1], "format")) {
+        try format(args[2]);
+    } else if (args.len == 4 and std.mem.eql(u8, args[1], "mount")) {
+        try @import("mount.zig").mount(args[2], args[3]);
+    } else {
+        std.debug.print("Usage: zqueel-fs format <new-database>\n       zqueel-fs mount <database> <mountpoint>\n", .{});
         return error.InvalidArguments;
     }
-    try format(args[2]);
 }
 
 fn exec(db: *c.sqlite3, sql: [*:0]const u8) !void {

@@ -22,11 +22,51 @@
 - `file_chunks`: sparse, logically indexed content chunks with potentially short payloads.
 - `fs_meta`: at most one row recording format version, root inode, and chunk size.
 - `AGENTS.md` provides entry-point instructions for subsequent agents.
-- `src/main.zig` implements `zqueel-fs format <new-database>` only; `src/ffi.h` exposes SQLite/POSIX APIs through Zig translate-c.
+- `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
 - The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
-- **Incomplete:** mounting, FUSE callbacks, embedded filesystem API, filesystem operations, migrations, persistent tests, and cleanup runner are not implemented.
+- `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read, empty-file create, and utimens callbacks.
+- Create atomically inserts an inode and directory entry and updates parent mtime/ctime; it uses FUSE credentials and inherits the parent gid when setgid is set.
+- `utimens` updates atime/mtime and ctime atomically, supports UTIME_NOW and UTIME_OMIT, and relies on kernel default_permissions checks.
+- **Incomplete:** write/delete/mkdir/rmdir/rename, open-handle lifetime, embedded filesystem API, migrations, persistent tests, and cleanup runner are not implemented; the mount cannot yet satisfy the basic shell workflow.
+- The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
+
+## Operation tracking
+
+Implemented means code exists, not that it is thoroughly tested or POSIX-compliant. The mount permits empty-file creation and timestamp changes but rejects writes and truncation.
+
+| Operation | FUSE callback / component | Example | Status |
+|---|---|---|---|
+| Format a new database | Formatter | `zqueel-fs format new.db` | Implemented; refuses an existing path |
+| Mount a database | Mount setup | `zqueel-fs mount test.db temp-mount/` | Implemented; foreground, single-threaded, limited mutations |
+| Look up a path | Internal lookup | Access `dir/file` | Basic implementation |
+| Read metadata | `getattr` | `stat file`, `ls -l` | Basic implementation |
+| List a directory | `readdir` | `ls directory/` | Basic implementation |
+| Open an existing file | `open` | Open for reading | Basic implementation |
+| Read file contents | `read` | `cat file` | Implemented, including zero-filled sparse ranges |
+| Unmount | External FUSE utility | `fusermount3 -u temp-mount/` | Supported through external utility |
+| Create a file | `create` | `touch file` | Basic empty-file creation implemented |
+| Write or append | `write` | `echo hello > file` | Pending; explicitly returns `EOPNOTSUPP` |
+| Resize a file | `truncate` | `truncate -s 100 file` | Pending; explicitly returns `EOPNOTSUPP` |
+| Delete a file | `unlink` | `rm file` | Pending |
+| Create a directory | `mkdir` | `mkdir dir` | Pending |
+| Remove an empty directory | `rmdir` | `rmdir dir` | Pending |
+| Rename or move | `rename` | `mv old new` | Pending |
+| Change permissions or owner | `chmod`, `chown` | `chmod 600 file` | Pending |
+| Change timestamps | `utimens` | `touch -t ... file` | Basic implementation; explicit times, now/omit, and ctime updates |
+| Create links | `link`, `symlink`, `readlink` | `ln`, `ln -s` | Pending; phase-1 scope not decided |
+| Sync data | `fsync`, `fsyncdir` | `fsync(2)` | Pending; durability contract also needs definition |
+| Open-handle lifecycle | `release` and shared core | Read an open file after unlink | Pending |
+
+| Other area | Status |
+|---|---|
+| Embedded Zig filesystem API | Pending |
+| pjdfstest and persistent regression tests | Pending |
+| Crash recovery, concurrent access, and durability validation | Pending |
+| Clean handling of Ctrl+C | Pending; currently may report `MountFailed` |
+
+Update this table as operations are implemented or their scope changes; record validation separately.
 
 ## Proposed v1 details still subject to review
 
@@ -114,11 +154,19 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Verified the DDL leaves inodes/fs_meta empty for future atomic bootstrap; no on-disk database, mounts, privileged commands, or persistent test harness were used.
 - Built the partial formatter with `zig build` using Zig 0.17, SQLite, and libfuse3.
 - Formatted a temporary database, inspected root/metadata, checked integrity and foreign keys, and verified a second format refuses and leaves it unchanged.
-- No mount was performed. These checks do not validate filesystem semantics, durability, security against hostile pathname replacement, or cross-row invariants.
+- With user authorization, mounted a fresh temporary database unprivileged, listed and read an injected sparse file, verified writes fail with EROFS, unmounted and verified the mount was gone before cleanup.
+- Earlier failed mount attempts were preserved at `/tmp/zqueel-fuse-smoke-qrvfd9a2` and `/tmp/zqueel-fuse-check-knfxvngx`; neither was mounted. Do not delete without authorization.
+- After implementing empty-file create, built with `zig build` and tested an authorized temporary mount: creation, umask/mode, ownership, empty read, duplicate rejection, and unsupported write/truncate.
+- Injected a SQLite trigger failure during dirent creation and verified rollback left no orphan inode; checked database integrity and foreign keys after unmount.
+- Before utimens implementation, `touch` created an empty file but reported an error because timestamp updates were unimplemented.
+- After implementing utimens, built with `zig build` and tested a fresh authorized temporary mount: touch new/existing, nanosecond and negative timestamps, UTIME_NOW/UTIME_OMIT, both-omit no-op, root-directory and file-descriptor updates.
+- A trigger-injected SQLite update failure left the original timestamps unchanged; integrity and foreign-key checks passed after unmount.
+- An earlier timestamp smoke-test attempt used a differently owned injected inode and failed at kernel permission checks as expected; its unmounted artifacts remain at `/tmp/zqueel-utimens-ygv686wz` for inspection.
+- These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)
 
-1. Implement the shared filesystem core and libfuse3 callbacks for basic file/directory operations; report unsupported operations explicitly.
+1. Implement shared filesystem core and remaining writable FUSE callbacks for write/truncate/delete/mkdir/rmdir/rename, as requested.
 2. Define and implement inode handle lifetime, synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
-3. Obtain explicit authorization before mounting on this machine, then validate shell operations on a freshly created dedicated mount.
+3. Validate writable shell operations on a fresh dedicated mount; user authorized an unprivileged temporary mount smoke test.
 4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.
