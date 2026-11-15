@@ -2,7 +2,7 @@
 
 ## Read first
 
-1. Read `docs/STATUS.md` for decisions, unresolved questions, current state, and next steps.
+1. Read `docs/STATUS.md`, starting with "Resume here", for decisions, unresolved questions, current state, and next steps.
 2. Read `schema.sql` before proposing storage changes; each table and column has a one-line Linux filesystem mapping.
 3. Read the current contents of any file before editing it; preserve user/manual changes unless explicitly asked to change them.
 
@@ -17,6 +17,7 @@
 ## Working rules
 
 - Ask about meaningful unresolved design choices rather than treating proposals as approved requirements.
+- Use subagents for relevant independent work when a subagent tool is available; the user explicitly requested this. Do not claim delegation when no such tool is available.
 - Do not implement future work merely because it appears in the handoff checklist.
 - Do not run privileged filesystem tests, mount/unmount commands, or destructive cleanup without explicit authorization.
 - Work is currently on the user's main machine; there is no isolated test environment.
@@ -28,6 +29,7 @@
 ## Files
 
 - `schema.sql`: reviewable proposed v1 schema.
-- `docs/STATUS.md`: project bookkeeping and continuation notes.
+- `docs/STATUS.md`: project bookkeeping and continuation notes, including the paused unlink/open-handle design discussion.
+- `docs/LINUX_FILESYSTEM_NOTES.md`: generic Linux concepts; illustrative designs are not implemented-feature claims.
 - `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
 - `build.zig`, `build.zig.zon`: Zig 0.17 executable configuration with SQLite and libfuse3 linkage.

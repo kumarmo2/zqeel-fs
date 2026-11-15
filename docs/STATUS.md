@@ -1,5 +1,18 @@
 # Project status and continuation notes
 
+## Resume here
+
+- Last implementation commit: `1c9c3cd` (`Implement directory creation`); mkdir is implemented and validated. See the operation table below for the full baseline.
+- The user requested unlink next, but implementation paused for Linux filesystem explanations. **No unlink callback or handle tracking has been implemented.**
+- Before coding unlink, resolve its open-file semantics with the user: full Linux behavior with inode-based handles versus an explicitly limited EBUSY-on-open implementation. The user asked explanatory questions but has not selected either option.
+- Current callbacks resolve objects by pathname. `open`/`create` do not allocate handle IDs; `fi->fh`, open-count maps, and `release` are not wired up. Supporting open-after-unlink requires more than deleting directory entries.
+- Discussed design, not approved implementation: volatile handle-ID-to-inode/open-state mappings plus per-inode open-reference counts; reclaim only when both persistent nlink and open references reach zero. The kernel tracks application FDs and their sharing; FUSE release signals the end of an open instance.
+- Only the initial flags field of opaque `fuse_file_info` is exposed by our Zig ABI-prefix accessor. Access to fh would need an extended, header-checked binding; do not assume it exists.
+- A single active filesystem instance is a design assumption, not an enforced database lock. Do not reclaim zero-link inodes on startup without addressing ownership/coordination.
+- The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
+- pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
+- The latest request was documentation/handoff maintenance only. Preserve staged/manual changes and do not commit or implement additional operations without a request.
+
 ## Goal and confirmed decisions
 
 - Build a production-grade SQLite-backed filesystem primarily for production agents.
@@ -22,6 +35,7 @@
 - `file_chunks`: sparse, logically indexed content chunks with potentially short payloads.
 - `fs_meta`: at most one row recording format version, root inode, and chunk size.
 - `AGENTS.md` provides entry-point instructions for subsequent agents.
+- `docs/LINUX_FILESYSTEM_NOTES.md` retains generic Linux filesystem knowledge: inodes/names, open/VFS/FUSE, descriptors versus open instances, unlink lifetime, links, redirection/truncation, timestamps, directories, and atomicity versus durability; examples are not implementation-status claims.
 - `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
 - The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
@@ -82,6 +96,7 @@ The schema records a concrete proposal, not approval of all operation semantics.
 - Dot and dot-dot are synthesized/resolved rather than stored as directory-entry rows.
 - Multiple directory entries may reference a regular-file inode, leaving room for hard links; phase-1 hard-link support is not decided.
 - No cascaded deletes; final inode/content reclamation must be explicit.
+- Deferred ROLLBACK protects mutation callbacks on ordinary error returns, but its return code is currently ignored. Handling rollback failure/uncertain connection state is future hardening; process crashes rely on SQLite recovery rather than Zig defer.
 - Timestamps are signed integer nanoseconds since the Unix epoch; ctime is status-change time, not birth time.
 - Chunk size is persisted per database and must not change after formatting.
 - The initial formatter uses a 64 KiB chunk size; this implementation choice needs performance measurement.
@@ -178,7 +193,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 
 ## Suggested next work (only when requested)
 
-1. Implement shared filesystem core and remaining writable FUSE callbacks for delete/rmdir/rename, as requested.
-2. Define and implement inode handle lifetime, synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
+1. Resume the unlink/open-file-lifetime scope discussion, then implement the agreed semantics; no choice has been finalized.
+2. Add rmdir/rename and the shared embedded core only when requested; define synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
 3. Validate writable shell operations on a fresh dedicated mount; user authorized an unprivileged temporary mount smoke test.
 4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.
