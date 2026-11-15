@@ -3,7 +3,7 @@
 ## Goal and confirmed decisions
 
 - Build a production-grade SQLite-backed filesystem primarily for production agents.
-- Implementation language/toolchain: Zig 0.17; database access through SQLite's C library.
+- Implementation language/toolchain: Zig 0.17; database access through SQLite's C library; user prefers project implementation in Zig rather than C source files.
 - Expose both an embedded API and a mountable filesystem.
 - Separate inode identity, directory names, and file contents.
 - Store contents in logical chunks, not one growing BLOB per file.
@@ -26,15 +26,17 @@
 - The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
-- `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read, empty-file create, and utimens callbacks.
+- `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read/write, empty-file create, and utimens callbacks.
 - Create atomically inserts an inode and directory entry and updates parent mtime/ctime; it uses FUSE credentials and inherits the parent gid when setgid is set.
 - `utimens` updates atime/mtime and ctime atomically, supports UTIME_NOW and UTIME_OMIT, and relies on kernel default_permissions checks.
-- **Incomplete:** write/delete/mkdir/rmdir/rename, open-handle lifetime, embedded filesystem API, migrations, persistent tests, and cleanup runner are not implemented; the mount cannot yet satisfy the basic shell workflow.
+- `write` updates affected chunks, size, mtime and ctime in one SQLite transaction, supports append and sparse gaps, and clears setuid/setgid bits.
+- Zig accesses the initial `int32_t flags` ABI field of opaque `fuse_file_info` via an extern-struct prefix; `src/ffi.h` has compile-time assertions for field offset and width against the installed libfuse headers.
+- **Incomplete:** truncate/delete/mkdir/rmdir/rename, open-handle lifetime, embedded filesystem API, migrations, persistent tests, and cleanup runner are not implemented; the mount cannot yet satisfy the basic shell workflow.
 - The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
 
 ## Operation tracking
 
-Implemented means code exists, not that it is thoroughly tested or POSIX-compliant. The mount permits empty-file creation and timestamp changes but rejects writes and truncation.
+Implemented means code exists, not that it is thoroughly tested or POSIX-compliant. The mount supports writes and append but rejects truncation.
 
 | Operation | FUSE callback / component | Example | Status |
 |---|---|---|---|
@@ -47,7 +49,7 @@ Implemented means code exists, not that it is thoroughly tested or POSIX-complia
 | Read file contents | `read` | `cat file` | Implemented, including zero-filled sparse ranges |
 | Unmount | External FUSE utility | `fusermount3 -u temp-mount/` | Supported through external utility |
 | Create a file | `create` | `touch file` | Basic empty-file creation implemented |
-| Write or append | `write` | `echo hello > file` | Pending; explicitly returns `EOPNOTSUPP` |
+| Write or append | `write` | `echo hello > new-file`, `echo hello >> file` | Basic implementation; sparse, partial and cross-chunk writes supported |
 | Resize a file | `truncate` | `truncate -s 100 file` | Pending; explicitly returns `EOPNOTSUPP` |
 | Delete a file | `unlink` | `rm file` | Pending |
 | Create a directory | `mkdir` | `mkdir dir` | Pending |
@@ -162,11 +164,14 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - After implementing utimens, built with `zig build` and tested a fresh authorized temporary mount: touch new/existing, nanosecond and negative timestamps, UTIME_NOW/UTIME_OMIT, both-omit no-op, root-directory and file-descriptor updates.
 - A trigger-injected SQLite update failure left the original timestamps unchanged; integrity and foreign-key checks passed after unmount.
 - An earlier timestamp smoke-test attempt used a differently owned injected inode and failed at kernel permission checks as expected; its unmounted artifacts remain at `/tmp/zqueel-utimens-ygv686wz` for inspection.
+- After implementing write, debug and ReleaseSafe builds passed. Authorized temporary-mount checks covered partial overwrites, cross-chunk writes, sparse gaps, append, concurrent append, shell creation/write, and persistence after remount.
+- An injected SQLite failure on the second chunk rolled back the entire write; integrity and foreign-key checks passed. Truncation remains explicitly unsupported.
+- Replaced the temporary C helper with a Zig ABI-prefix accessor; debug and ReleaseSafe builds passed, and an authorized temporary mount verified O_APPEND overrides a pwrite offset.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)
 
-1. Implement shared filesystem core and remaining writable FUSE callbacks for write/truncate/delete/mkdir/rmdir/rename, as requested.
+1. Implement shared filesystem core and remaining writable FUSE callbacks for truncate/delete/mkdir/rmdir/rename, as requested.
 2. Define and implement inode handle lifetime, synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
 3. Validate writable shell operations on a fresh dedicated mount; user authorized an unprivileged temporary mount smoke test.
 4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.

@@ -2,10 +2,20 @@ const std = @import("std");
 const c = @import("ffi");
 
 // FUSE is single-threaded, so callbacks share one SQLite connection without a mutex.
-// Empty-file creation and timestamp updates are supported; data writes remain unsupported.
+// Data writes are transactional; truncation and other mutations remain unsupported.
 var database: *c.sqlite3 = undefined;
 var root: i64 = undefined;
 var chunk_size: i64 = undefined;
+
+// libfuse3's ABI begins fuse_file_info with int32_t flags; ffi.h verifies this
+// against the installed header because translate-c cannot translate its bitfields.
+const FuseFileInfoPrefix = extern struct { flags: i32 };
+
+fn fuseOpenFlags(info: ?*c.struct_fuse_file_info) i32 {
+    const ptr = info orelse return 0;
+    const prefix: *const FuseFileInfoPrefix = @ptrCast(@alignCast(ptr));
+    return prefix.flags;
+}
 
 const Node = struct {
     id: i64,
@@ -70,7 +80,6 @@ fn getattr(path: [*c]const u8, st: [*c]c.struct_stat, _: ?*c.struct_fuse_file_in
 }
 
 fn readdir(path: [*c]const u8, buf: ?*anyopaque, filler: c.fuse_fill_dir_t, _: c.off_t, _: ?*c.struct_fuse_file_info, _: c.enum_fuse_readdir_flags) callconv(.c) c_int {
-    std.debug.print("inside readdir\n", .{});
     const n = lookup(path) orelse return -c.ENOENT;
     if ((n.mode & 0xf000) != 0x4000) return -c.ENOTDIR;
     const fill = filler orelse return -c.EIO;
@@ -96,11 +105,6 @@ fn open(path: [*c]const u8, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     const n = lookup(path) orelse return -c.ENOENT;
     if ((n.mode & 0xf000) != 0x8000) return -c.EISDIR;
     return 0;
-}
-
-// Until content mutation is implemented, never report a successful write or truncate.
-fn unsupportedWrite(_: [*c]const u8, _: [*c]const u8, _: usize, _: c.off_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    return -c.EOPNOTSUPP;
 }
 
 fn unsupportedTruncate(_: [*c]const u8, _: c.off_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
@@ -222,6 +226,71 @@ fn create(path: [*c]const u8, mode: c.mode_t, _: ?*c.struct_fuse_file_info) call
     return 0;
 }
 
+fn write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+    if (path == null or off < 0) return -c.EINVAL;
+    if (size > std.math.maxInt(c_int)) return -c.EINVAL;
+    if (c.sqlite3_exec(database, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) return sqliteError();
+    var committed = false;
+    defer if (!committed) {
+        _ = c.sqlite3_exec(database, "ROLLBACK", null, null, null);
+    };
+    const n = lookup(path) orelse return -c.ENOENT;
+    if ((n.mode & 0xf000) != 0x8000) return -c.EISDIR;
+    if (size == 0) return 0;
+    if (buf == null) return -c.EINVAL;
+    // With writeback caching disabled, libfuse requires us to enforce O_APPEND.
+    const start: i64 = if ((fuseOpenFlags(fi) & c.O_APPEND) != 0) n.size else off;
+    const end = std.math.add(i64, start, @as(i64, @intCast(size))) catch return -c.EFBIG;
+    const chunk_len: usize = @intCast(chunk_size);
+    const block = std.heap.page_allocator.alloc(u8, chunk_len) catch return -c.ENOMEM;
+    defer std.heap.page_allocator.free(block);
+    const select = prepare("SELECT data FROM file_chunks WHERE inode_id=? AND chunk_index=?") orelse return sqliteError();
+    defer _ = c.sqlite3_finalize(select);
+    const upsert = prepare("INSERT INTO file_chunks(inode_id,chunk_index,data) VALUES(?,?,?) ON CONFLICT(inode_id,chunk_index) DO UPDATE SET data=excluded.data") orelse return sqliteError();
+    defer _ = c.sqlite3_finalize(upsert);
+    var done: usize = 0;
+    while (done < size) {
+        const pos = start + @as(i64, @intCast(done));
+        const idx = @divTrunc(pos, chunk_size);
+        const within: usize = @intCast(@mod(pos, chunk_size));
+        const amount = @min(size - done, chunk_len - within);
+        @memset(block, 0);
+        if (c.sqlite3_reset(select) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(select, 1, n.id) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(select, 2, idx) != c.SQLITE_OK) return sqliteError();
+        const rc = c.sqlite3_step(select);
+        var old_len: usize = 0;
+        if (rc == c.SQLITE_ROW) {
+            old_len = @intCast(c.sqlite3_column_bytes(select, 0));
+            if (old_len == 0 or old_len > chunk_len) return -c.EIO;
+            const old: [*]const u8 = @ptrCast(c.sqlite3_column_blob(select, 0) orelse return -c.EIO);
+            @memcpy(block[0..old_len], old[0..old_len]);
+        } else if (rc != c.SQLITE_DONE) return sqliteError();
+        @memcpy(block[within..][0..amount], buf[done..][0..amount]);
+        const new_len = @max(old_len, within + amount);
+        if (c.sqlite3_reset(upsert) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(upsert, 1, n.id) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(upsert, 2, idx) != c.SQLITE_OK or
+            c.sqlite3_bind_blob(upsert, 3, block.ptr, @intCast(new_len), c.SQLITE_TRANSIENT) != c.SQLITE_OK or
+            c.sqlite3_step(upsert) != c.SQLITE_DONE) return sqliteError();
+        done += amount;
+    }
+    var clock: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_REALTIME, &clock) != 0) return -c.EIO;
+    const now = timestampNs(clock) catch return -c.EOVERFLOW;
+    // A successful content change removes set-user-ID and set-group-ID bits.
+    const update = prepare("UPDATE inodes SET size=?,mtime_ns=?,ctime_ns=?,mode=(mode & ~3072) WHERE inode_id=?") orelse return sqliteError();
+    defer _ = c.sqlite3_finalize(update);
+    if (c.sqlite3_bind_int64(update, 1, @max(n.size, end)) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 2, now) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 3, now) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 4, n.id) != c.SQLITE_OK or
+        c.sqlite3_step(update) != c.SQLITE_DONE) return sqliteError();
+    if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) return sqliteError();
+    committed = true;
+    return @intCast(size);
+}
+
 fn read(path: [*c]const u8, buf: [*c]u8, size: usize, off: c.off_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     const n = lookup(path) orelse return -c.ENOENT;
     if ((n.mode & 0xf000) != 0x8000) return -c.EISDIR;
@@ -285,7 +354,7 @@ pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
     ops.read = read;
     ops.create = create;
     ops.utimens = utimens;
-    ops.write = unsupportedWrite;
+    ops.write = write;
     ops.truncate = unsupportedTruncate;
     var argv = [_][*c]u8{ @constCast("zqueel-fs"), @constCast("-f"), @constCast("-s"), @constCast("-o"), @constCast("default_permissions"), @constCast(mountpoint.ptr) };
     if (c.fuse_main_fn(@intCast(argv.len), &argv, &ops, null) != 0) return error.MountFailed;

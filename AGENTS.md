@@ -8,7 +8,7 @@
 
 ## Project constraints
 
-- Production-oriented SQLite-backed filesystem for agents, implemented in Zig 0.17 using SQLite's C library.
+- Production-oriented SQLite-backed filesystem for agents, implemented in Zig 0.17 using SQLite's C library; prefer Zig implementation code over project-owned C source.
 - Intended interfaces: embedded library API and a mountable POSIX interface; libfuse3 is the selected mount technology.
 - Chosen design direction: inode/directory-entry separation, chunked contents, and POSIX metadata.
 - Current priority: implement a basic libfuse3 mount supporting normal file/directory shell operations; report unsupported features explicitly.
@@ -29,5 +29,5 @@
 
 - `schema.sql`: reviewable proposed v1 schema.
 - `docs/STATUS.md`: project bookkeeping and continuation notes.
-- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; empty-file creation and timestamp updates are supported but writes and most other mutations remain unimplemented.
+- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file creation, writes and timestamp updates are supported, while truncation and most other mutations remain unimplemented.
 - `build.zig`, `build.zig.zon`: Zig 0.17 executable configuration with SQLite and libfuse3 linkage.
