@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("ffi");
 
 // FUSE is single-threaded, so callbacks share one SQLite connection without a mutex.
-// Data writes are transactional; truncation and other mutations remain unsupported.
+// Data writes and truncations are transactional; other mutations remain unsupported.
 var database: *c.sqlite3 = undefined;
 var root: i64 = undefined;
 var chunk_size: i64 = undefined;
@@ -101,14 +101,57 @@ fn readdir(path: [*c]const u8, buf: ?*anyopaque, filler: c.fuse_fill_dir_t, _: c
     }
 }
 
-fn open(path: [*c]const u8, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+fn open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+    // libfuse enables atomic O_TRUNC by default, passing it to open rather than truncate.
+    if ((fuseOpenFlags(fi) & c.O_TRUNC) != 0) return truncate(path, 0, fi);
     const n = lookup(path) orelse return -c.ENOENT;
     if ((n.mode & 0xf000) != 0x8000) return -c.EISDIR;
     return 0;
 }
 
-fn unsupportedTruncate(_: [*c]const u8, _: c.off_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    return -c.EOPNOTSUPP;
+fn truncate(path: [*c]const u8, size: c.off_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+    if (path == null or size < 0) return -c.EINVAL;
+    if (c.sqlite3_exec(database, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) return sqliteError();
+    var committed = false;
+    defer if (!committed) {
+        _ = c.sqlite3_exec(database, "ROLLBACK", null, null, null);
+    };
+    const n = lookup(path) orelse return -c.ENOENT;
+    if ((n.mode & 0xf000) != 0x8000) return -c.EISDIR;
+    if (size < n.size) {
+        const boundary = @divTrunc(size, chunk_size);
+        const tail = @mod(size, chunk_size);
+        // At a chunk boundary delete that chunk too; otherwise keep and trim it.
+        const delete_from = boundary + @as(i64, @intFromBool(tail != 0));
+        const remove = prepare("DELETE FROM file_chunks WHERE inode_id=? AND chunk_index>=?") orelse return sqliteError();
+        defer _ = c.sqlite3_finalize(remove);
+        if (c.sqlite3_bind_int64(remove, 1, n.id) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(remove, 2, delete_from) != c.SQLITE_OK or
+            c.sqlite3_step(remove) != c.SQLITE_DONE) return sqliteError();
+        if (tail != 0) {
+            const trim = prepare("UPDATE file_chunks SET data=substr(data,1,?) WHERE inode_id=? AND chunk_index=? AND length(data)>?") orelse return sqliteError();
+            defer _ = c.sqlite3_finalize(trim);
+            if (c.sqlite3_bind_int64(trim, 1, tail) != c.SQLITE_OK or
+                c.sqlite3_bind_int64(trim, 2, n.id) != c.SQLITE_OK or
+                c.sqlite3_bind_int64(trim, 3, boundary) != c.SQLITE_OK or
+                c.sqlite3_bind_int64(trim, 4, tail) != c.SQLITE_OK or
+                c.sqlite3_step(trim) != c.SQLITE_DONE) return sqliteError();
+        }
+    }
+    // Extension creates no chunks: absent ranges already read as zero.
+    var clock: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_REALTIME, &clock) != 0) return -c.EIO;
+    const now = timestampNs(clock) catch return -c.EOVERFLOW;
+    const update = prepare("UPDATE inodes SET size=?,mtime_ns=?,ctime_ns=?,mode=(mode & ~3072) WHERE inode_id=?") orelse return sqliteError();
+    defer _ = c.sqlite3_finalize(update);
+    if (c.sqlite3_bind_int64(update, 1, size) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 2, now) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 3, now) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(update, 4, n.id) != c.SQLITE_OK or
+        c.sqlite3_step(update) != c.SQLITE_DONE) return sqliteError();
+    if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) return sqliteError();
+    committed = true;
+    return 0;
 }
 
 fn sqliteError() c_int {
@@ -355,7 +398,7 @@ pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
     ops.create = create;
     ops.utimens = utimens;
     ops.write = write;
-    ops.truncate = unsupportedTruncate;
+    ops.truncate = truncate;
     var argv = [_][*c]u8{ @constCast("zqueel-fs"), @constCast("-f"), @constCast("-s"), @constCast("-o"), @constCast("default_permissions"), @constCast(mountpoint.ptr) };
     if (c.fuse_main_fn(@intCast(argv.len), &argv, &ops, null) != 0) return error.MountFailed;
 }
