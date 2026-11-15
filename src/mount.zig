@@ -212,6 +212,16 @@ fn utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, _: ?*c.struct_fu
 }
 
 fn create(path: [*c]const u8, mode: c.mode_t, _: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+    return createNode(path, mode, false);
+}
+
+fn mkdir(path: [*c]const u8, mode: c.mode_t) callconv(.c) c_int {
+    return createNode(path, mode, true);
+}
+
+// Share namespace validation and the atomic inode/dirent insertion for files and directories.
+fn createNode(path: [*c]const u8, mode: c.mode_t, directory: bool) c_int {
+    if (path == null) return -c.EINVAL;
     const full = std.mem.span(path);
     const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return -c.EINVAL;
     const name = full[slash + 1 ..];
@@ -242,9 +252,17 @@ fn create(path: [*c]const u8, mode: c.mode_t, _: ?*c.struct_fuse_file_info) call
     const seconds = std.math.mul(i64, clock.tv_sec, 1_000_000_000) catch return -c.EOVERFLOW;
     const now = std.math.add(i64, seconds, clock.tv_nsec) catch return -c.EOVERFLOW;
     const gid: i64 = if ((parent.mode & 0o2000) != 0) parent.gid else @intCast(context.*.gid);
-    const inode = prepare("INSERT INTO inodes(mode,uid,gid,nlink,size,atime_ns,mtime_ns,ctime_ns) VALUES(?,?,?,1,0,?,?,?)") orelse return sqliteError();
+    // The kernel applies umask before calling us; a setgid parent also passes its
+    // setgid bit to new subdirectories, independently of the requested permissions.
+    const inherited: c.mode_t = if (directory and (parent.mode & 0o2000) != 0) 0o2000 else 0;
+    const kind: c.mode_t = if (directory) 0o40000 else 0o100000;
+    const inode_sql: [*:0]const u8 = if (directory)
+        "INSERT INTO inodes(mode,uid,gid,nlink,size,atime_ns,mtime_ns,ctime_ns) VALUES(?,?,?,2,0,?,?,?)"
+    else
+        "INSERT INTO inodes(mode,uid,gid,nlink,size,atime_ns,mtime_ns,ctime_ns) VALUES(?,?,?,1,0,?,?,?)";
+    const inode = prepare(inode_sql) orelse return sqliteError();
     defer _ = c.sqlite3_finalize(inode);
-    if (c.sqlite3_bind_int64(inode, 1, @intCast((mode & 0o7777) | 0o100000)) != c.SQLITE_OK or
+    if (c.sqlite3_bind_int64(inode, 1, @intCast((mode & 0o7777) | kind | inherited)) != c.SQLITE_OK or
         c.sqlite3_bind_int64(inode, 2, @intCast(context.*.uid)) != c.SQLITE_OK or
         c.sqlite3_bind_int64(inode, 3, gid) != c.SQLITE_OK or
         c.sqlite3_bind_int64(inode, 4, now) != c.SQLITE_OK or
@@ -258,7 +276,12 @@ fn create(path: [*c]const u8, mode: c.mode_t, _: ?*c.struct_fuse_file_info) call
         c.sqlite3_bind_blob(entry, 2, name.ptr, @intCast(name.len), c.SQLITE_TRANSIENT) != c.SQLITE_OK or
         c.sqlite3_bind_int64(entry, 3, inode_id) != c.SQLITE_OK or
         c.sqlite3_step(entry) != c.SQLITE_DONE) return sqliteError();
-    const update = prepare("UPDATE inodes SET mtime_ns=?, ctime_ns=? WHERE inode_id=?") orelse return sqliteError();
+    // A directory begins with two links; its parent gains one for the child's '..'.
+    const parent_sql: [*:0]const u8 = if (directory)
+        "UPDATE inodes SET mtime_ns=?, ctime_ns=?, nlink=nlink+1 WHERE inode_id=?"
+    else
+        "UPDATE inodes SET mtime_ns=?, ctime_ns=? WHERE inode_id=?";
+    const update = prepare(parent_sql) orelse return sqliteError();
     defer _ = c.sqlite3_finalize(update);
     if (c.sqlite3_bind_int64(update, 1, now) != c.SQLITE_OK or
         c.sqlite3_bind_int64(update, 2, now) != c.SQLITE_OK or
@@ -396,6 +419,7 @@ pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
     ops.open = open;
     ops.read = read;
     ops.create = create;
+    ops.mkdir = mkdir;
     ops.utimens = utimens;
     ops.write = write;
     ops.truncate = truncate;

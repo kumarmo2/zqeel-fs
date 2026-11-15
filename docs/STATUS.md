@@ -26,13 +26,14 @@
 - The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
-- `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read/write, truncate, empty-file create, and utimens callbacks.
-- Create atomically inserts an inode and directory entry and updates parent mtime/ctime; it uses FUSE credentials and inherits the parent gid when setgid is set.
+- `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read/write, truncate, file/directory creation, and utimens callbacks.
+- File creation and mkdir share an atomic inode/dirent insertion helper with parent mtime/ctime updates and FUSE credentials.
+- mkdir starts directories with nlink=2, increments parent nlink, and inherits gid/setgid from a setgid parent; the kernel applies umask.
 - `utimens` updates atime/mtime and ctime atomically, supports UTIME_NOW and UTIME_OMIT, and relies on kernel default_permissions checks.
 - `write` updates affected chunks, size, mtime and ctime in one SQLite transaction, supports append and sparse gaps, and clears setuid/setgid bits.
 - Zig accesses the initial `int32_t flags` ABI field of opaque `fuse_file_info` via an extern-struct prefix; `src/ffi.h` has compile-time assertions for field offset and width against the installed libfuse headers.
 - `truncate` handles shrink/extension and atomically trims/deletes discarded chunks with inode metadata; `open` handles libfuse's default atomic O_TRUNC path.
-- **Incomplete:** delete/mkdir/rmdir/rename, open-handle lifetime, embedded filesystem API, migrations, persistent tests, and cleanup runner are not implemented; the mount cannot yet satisfy the basic shell workflow.
+- **Incomplete:** delete/rmdir/rename, open-handle lifetime, embedded filesystem API, migrations, persistent tests, and cleanup runner are not implemented; the mount cannot yet satisfy the basic shell workflow.
 - The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
 
 ## Operation tracking
@@ -53,7 +54,7 @@ Implemented means code exists, not that it is thoroughly tested or POSIX-complia
 | Write or append | `write` | `echo hello > new-file`, `echo hello >> file` | Basic implementation; sparse, partial and cross-chunk writes supported |
 | Resize a file | `truncate`, `open` (O_TRUNC) | `truncate -s 100 file`, `echo text > existing-file` | Basic implementation; shrinking discards data and extension reads as zero |
 | Delete a file | `unlink` | `rm file` | Pending |
-| Create a directory | `mkdir` | `mkdir dir` | Pending |
+| Create a directory | `mkdir` | `mkdir dir`, `mkdir -p a/b` | Basic implementation; atomic creation, parent link counts/timestamps and setgid inheritance |
 | Remove an empty directory | `rmdir` | `rmdir dir` | Pending |
 | Rename or move | `rename` | `mv old new` | Pending |
 | Change permissions or owner | `chmod`, `chown` | `chmod 600 file` | Pending |
@@ -170,11 +171,14 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Replaced the temporary C helper with a Zig ABI-prefix accessor; debug and ReleaseSafe builds passed, and an authorized temporary mount verified O_APPEND overrides a pwrite offset.
 - Implemented `truncate` and the atomic O_TRUNC open path: debug and ReleaseSafe builds passed; an authorized temporary mount verified shell overwrite/append, ftruncate shrink/extend across chunk boundaries, zero-filled extension, rollback on injected chunk-delete failure, and persistence after remount.
 - SQLite integrity and foreign-key checks passed after the truncation smoke test. Previously observed successful shell overwrites with stale trailing bytes resulted from libfuse's default atomic O_TRUNC path passing the flag to `open`, which previously ignored it.
+- After implementing mkdir, debug and ReleaseSafe builds passed. An authorized fresh temporary mount validated mkdir/mkdir -p, mode/umask, ownership, parent/child link counts, nested file I/O, duplicate/missing-parent/non-directory/long-name errors, setgid inheritance, and persistence after remount.
+- A trigger-injected parent-link-count update failure rolled back the new inode, directory entry and parent metadata; SQLite integrity/foreign-key checks passed and no directory content chunks were present.
+- Subagent delegation was requested where relevant; no subagent tool was available in this session.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)
 
-1. Implement shared filesystem core and remaining writable FUSE callbacks for delete/mkdir/rmdir/rename, as requested.
+1. Implement shared filesystem core and remaining writable FUSE callbacks for delete/rmdir/rename, as requested.
 2. Define and implement inode handle lifetime, synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
 3. Validate writable shell operations on a fresh dedicated mount; user authorized an unprivileged temporary mount smoke test.
 4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.

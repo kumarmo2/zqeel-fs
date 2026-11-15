@@ -29,5 +29,5 @@
 
 - `schema.sql`: reviewable proposed v1 schema.
 - `docs/STATUS.md`: project bookkeeping and continuation notes.
-- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file creation, writes, truncation and timestamp updates are supported, while most other mutations remain unimplemented.
+- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
 - `build.zig`, `build.zig.zon`: Zig 0.17 executable configuration with SQLite and libfuse3 linkage.
