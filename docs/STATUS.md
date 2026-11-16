@@ -11,7 +11,7 @@
 - On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
 - pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
-- The latest request was to use Zig's `std.os.linux.flock` for database locking. Preserve manual changes and do not commit or implement additional operations without a request.
+- The latest request was to use Zig standard-library Linux APIs in the locking test. Preserve manual changes and do not commit or implement additional operations without a request.
 
 ## Goal and confirmed decisions
 
@@ -192,7 +192,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - After implementing mkdir, debug and ReleaseSafe builds passed. An authorized fresh temporary mount validated mkdir/mkdir -p, mode/umask, ownership, parent/child link counts, nested file I/O, duplicate/missing-parent/non-directory/long-name errors, setgid inheritance, and persistence after remount.
 - A trigger-injected parent-link-count update failure rolled back the new inode, directory entry and parent metadata; SQLite integrity/foreign-key checks passed and no directory content chunks were present.
 - Subagent delegation was requested where relevant; no subagent tool was available in this earlier session.
-- On `feature/database-locking`, debug and ReleaseSafe builds passed; `zig build test` exercised flock contention across a fork and independent descriptors, then reacquisition after close using an anonymous file. Expected contention diagnostics appear in test output. These builds and tests passed again after switching flock to `std.os.linux.flock`.
+- On `feature/database-locking`, debug and ReleaseSafe builds passed; `zig build test` exercised flock contention across a fork and independent descriptors, then reacquisition after close using an anonymous file. Expected contention diagnostics appear in test output. Builds and tests passed again after switching flock and test setup to `std.os.linux` APIs; the test still calls the production locking functions.
 - Formatted a fresh database and verified integrity, foreign keys, and existing-file refusal without modification. The test database is retained at `/tmp/zqueel-lock-check-84aptv1z`; no mount/unmount or cleanup was performed. No actual mount-lifetime integration test was run.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
