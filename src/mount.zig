@@ -391,6 +391,8 @@ fn read(path: [*c]const u8, buf: [*c]u8, size: usize, off: c.off_t, _: ?*c.struc
 }
 
 pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
+    const lock_fd = try @import("database_lock.zig").open(path);
+    defer _ = c.close(lock_fd);
     var handle: ?*c.sqlite3 = null;
     const result = c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READWRITE, null);
     const db = handle orelse return error.DatabaseOpen;

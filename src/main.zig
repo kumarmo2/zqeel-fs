@@ -29,8 +29,9 @@ fn format(path: [:0]const u8) !void {
         std.debug.print("Cannot create database exclusively: {s}\n", .{path});
         return error.CreateDatabase;
     }
-    _ = c.close(fd);
+    defer _ = c.close(fd);
     errdefer std.debug.print("Formatting failed; inspect the newly created file before removing it: {s}\n", .{path});
+    try @import("database_lock.zig").acquire(fd, path);
 
     var maybe_db: ?*c.sqlite3 = null;
     const rc = c.sqlite3_open_v2(path.ptr, &maybe_db, c.SQLITE_OPEN_READWRITE, null);

@@ -8,10 +8,10 @@
 - Current callbacks resolve objects by pathname. `open`/`create` do not allocate handle IDs; `fi->fh`, open-count maps, and `release` are not wired up. Supporting open-after-unlink requires more than deleting directory entries.
 - Discussed design, not approved implementation: volatile handle-ID-to-inode/open-state mappings plus per-inode open-reference counts; reclaim only when both persistent nlink and open references reach zero. The kernel tracks application FDs and their sharing; FUSE release signals the end of an open instance.
 - Only the initial flags field of opaque `fuse_file_info` is exposed by our Zig ABI-prefix accessor. Access to fh would need an extended, header-checked binding; do not assume it exists.
-- A single active filesystem instance is a design assumption, not an enforced database lock. Do not reclaim zero-link inodes on startup without addressing ownership/coordination.
+- On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
 - pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
-- The latest request was documentation/handoff maintenance only. Preserve staged/manual changes and do not commit or implement additional operations without a request.
+- The latest request was to use Zig's `std.os.linux.flock` for database locking. Preserve manual changes and do not commit or implement additional operations without a request.
 
 ## Goal and confirmed decisions
 
@@ -26,6 +26,7 @@
 - User requested a working mount for ordinary Linux file and directory commands, using libfuse3.
 - Initial scope is basic shell operations with unsupported POSIX features reported explicitly.
 - Formatting is a separate explicit command and must not overwrite existing databases.
+- Restrict cooperating zqueel-fs instances to one active owner per database using an exclusive flock; different databases may be used concurrently.
 
 ## Current repository state
 
@@ -37,7 +38,9 @@
 - `AGENTS.md` provides entry-point instructions for subsequent agents.
 - `docs/LINUX_FILESYSTEM_NOTES.md` retains generic Linux filesystem knowledge: inodes/names, open/VFS/FUSE, descriptors versus open instances, unlink lifetime, links, redirection/truncation, timestamps, directories, and atomicity versus durability; examples are not implementation-status claims.
 - `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
-- The formatter reserves a new file exclusively, initializes schema and root in one SQLite transaction, and refuses an existing path.
+- The formatter reserves a new file exclusively, locks it, initializes schema and root in one SQLite transaction, and refuses an existing path.
+- `src/database_lock.zig` acquires a nonblocking exclusive flock using `std.os.linux.flock`; format and mount hold its close-on-exec descriptor until after SQLite closes. Contention reports `DatabaseInUse`. Future embedded access must follow the same protocol.
+- Locking is advisory, assumes a stable database pathname and cooperating processes, and is intended for local filesystems. Direct SQLite users and file replacement can bypass it; network filesystem behavior is not guaranteed. Orphan recovery is not implemented.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
 - `src/mount.zig` implements an experimental, foreground, single-threaded FUSE mount with getattr, readdir, open, sparse chunk read/write, truncate, file/directory creation, and utimens callbacks.
@@ -147,7 +150,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Settle phase-1 operations: core files/directories versus hard links, symlinks, and additional POSIX functionality.
 - Define path lookup, rename replacement, open/unlink lifetime, directory size reporting, and timestamp-update policy.
 - Decide how shared-core code exposes embedded operations and the libfuse3 mount adapter.
-- Decide whether multiple independent processes may directly open the same filesystem database; open-handle lifetime coordination depends on this.
+- Design enforcement against non-cooperating database access and pathname replacement if required; the cooperative flock does not protect against either.
 - Define permissions/credentials, umask, special bits, and enforcement responsibilities.
 - Define write/fsync/directory-fsync and embedded transaction durability guarantees; select SQLite journaling/synchronous policy accordingly.
 - Design bootstrap, shutdown, locking, interrupted-operation recovery, and schema version migrations.
@@ -188,7 +191,9 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - SQLite integrity and foreign-key checks passed after the truncation smoke test. Previously observed successful shell overwrites with stale trailing bytes resulted from libfuse's default atomic O_TRUNC path passing the flag to `open`, which previously ignored it.
 - After implementing mkdir, debug and ReleaseSafe builds passed. An authorized fresh temporary mount validated mkdir/mkdir -p, mode/umask, ownership, parent/child link counts, nested file I/O, duplicate/missing-parent/non-directory/long-name errors, setgid inheritance, and persistence after remount.
 - A trigger-injected parent-link-count update failure rolled back the new inode, directory entry and parent metadata; SQLite integrity/foreign-key checks passed and no directory content chunks were present.
-- Subagent delegation was requested where relevant; no subagent tool was available in this session.
+- Subagent delegation was requested where relevant; no subagent tool was available in this earlier session.
+- On `feature/database-locking`, debug and ReleaseSafe builds passed; `zig build test` exercised flock contention across a fork and independent descriptors, then reacquisition after close using an anonymous file. Expected contention diagnostics appear in test output. These builds and tests passed again after switching flock to `std.os.linux.flock`.
+- Formatted a fresh database and verified integrity, foreign keys, and existing-file refusal without modification. The test database is retained at `/tmp/zqueel-lock-check-84aptv1z`; no mount/unmount or cleanup was performed. No actual mount-lifetime integration test was run.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)

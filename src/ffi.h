@@ -6,6 +6,9 @@
 #include <fuse3/fuse.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 
 /* Verify the ABI prefix accessed in Zig; translate-c cannot represent the bitfields. */
 #include <stddef.h>

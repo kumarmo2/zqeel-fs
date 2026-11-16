@@ -1,0 +1,67 @@
+const std = @import("std");
+const c = @import("ffi");
+
+// This advisory lock coordinates cooperating zqueel-fs instances only. The
+// database pathname must remain stable while SQLite and this descriptor are open.
+pub fn acquire(fd: c_int, path: [:0]const u8) !void {
+    while (true) {
+        const result = std.os.linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN => {
+                std.debug.print("Database is already in use: {s}\n", .{path});
+                return error.DatabaseInUse;
+            },
+            else => |errno| {
+                std.debug.print("Cannot lock database: {s} (errno {d})\n", .{ path, @intFromEnum(errno) });
+                return error.DatabaseLock;
+            },
+        }
+    }
+}
+
+pub fn open(path: [:0]const u8) !c_int {
+    const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
+    if (fd < 0) {
+        std.debug.print("Cannot open database for locking: {s}\n", .{path});
+        return error.DatabaseOpen;
+    }
+    errdefer _ = c.close(fd);
+    try acquire(fd, path);
+    return fd;
+}
+
+test "exclusive ownership contends across processes and releases on close" {
+    // An anonymous file avoids touching an existing database or leaving artifacts.
+    const fd: c_int = @intCast(c.syscall(c.SYS_memfd_create, @as([*:0]const u8, "zqueel-lock-test"), @as(c_uint, 0)));
+    try std.testing.expect(fd >= 0);
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/fd/{d}", .{ c.getpid(), fd }, 0);
+    try acquire(fd, path);
+
+    const child = c.fork();
+    try std.testing.expect(child >= 0);
+    if (child == 0) {
+        // Drop the inherited open-file description before trying a new one.
+        _ = c.close(fd);
+        const other = open(path) catch |err| {
+            c._exit(if (err == error.DatabaseInUse) 0 else 2);
+        };
+        _ = c.close(other);
+        c._exit(1);
+    }
+    var status: c_int = 0;
+    try std.testing.expectEqual(child, c.waitpid(child, &status, 0));
+    try std.testing.expectEqual(@as(c_int, 0), status);
+
+    // Separate open descriptions contend even in one process.
+    try std.testing.expectError(error.DatabaseInUse, open(path));
+    const keeper = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
+    try std.testing.expect(keeper >= 0);
+    defer _ = c.close(keeper);
+    try std.testing.expectEqual(@as(c_int, 0), c.close(fd));
+    const keeper_path = try std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/fd/{d}", .{ c.getpid(), keeper }, 0);
+    const next = try open(keeper_path);
+    _ = c.close(next);
+}
