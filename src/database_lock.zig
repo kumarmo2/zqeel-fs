@@ -59,7 +59,9 @@ test "exclusive ownership contends across processes and releases on close" {
     var status: i32 = 0;
     while (true) {
         const result = linux.waitpid(child, &status, 0);
-        if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) == .INTR) {
+            continue;
+        }
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
         try std.testing.expectEqual(child_result, result);
         break;
