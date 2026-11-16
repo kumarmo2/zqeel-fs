@@ -11,7 +11,7 @@
 - On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
 - pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
-- The latest request was to remove automatic EINTR retries from flock acquisition for now. Preserve manual changes and do not commit or implement additional operations without a request.
+- The latest request was documentation of the SQLite functions currently used in the program. Preserve manual changes and do not commit or implement additional operations without a request.
 
 ## Goal and confirmed decisions
 
@@ -37,6 +37,7 @@
 - `fs_meta`: at most one row recording format version, root inode, and chunk size.
 - `AGENTS.md` provides entry-point instructions for subsequent agents.
 - `docs/LINUX_FILESYSTEM_NOTES.md` retains generic Linux filesystem knowledge: inodes/names, open/VFS/FUSE, descriptors versus open instances, unlink lifetime, links, redirection/truncation, timestamps, directories, and atomicity versus durability; examples are not implementation-status claims.
+- `docs/SQLITE_FUNCTIONS.md` documents the SQLite C API calls used by the current Zig sources and the SQL `last_insert_rowid()` function, including ownership and error-handling caveats.
 - `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
 - The formatter reserves a new file exclusively, locks it, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - `src/database_lock.zig` acquires a nonblocking exclusive flock using `std.os.linux.flock`; format and mount hold its close-on-exec descriptor until after SQLite closes. Contention reports `DatabaseInUse`; EINTR currently reports `DatabaseLock` without retry. Future embedded access must follow the same protocol.
