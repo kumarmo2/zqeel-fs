@@ -1,5 +1,4 @@
 const std = @import("std");
-const c = @import("ffi");
 
 // This advisory lock coordinates cooperating zqueel-fs instances only. The
 // database pathname must remain stable while SQLite and this descriptor are open.
@@ -20,12 +19,17 @@ pub fn acquire(fd: c_int, path: [:0]const u8) !void {
 }
 
 pub fn open(path: [:0]const u8) !c_int {
-    const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
-    if (fd < 0) {
-        std.debug.print("Cannot open database for locking: {s}\n", .{path});
-        return error.DatabaseOpen;
-    }
-    errdefer _ = c.close(fd);
+    const result = std.os.linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+
+    const fd: c_int = switch (std.os.linux.errno(result)) {
+        .SUCCESS => @as(std.os.linux.fd_t, @intCast(result)),
+        else => |errno| {
+            std.debug.print("Cannot open database for locking, erro: {d}, path: {s}\n", .{ @backingInt(errno), path });
+            return error.DatabaseOpen;
+        },
+    };
+
+    errdefer _ = std.os.linux.close(fd);
     try acquire(fd, path);
     return fd;
 }
