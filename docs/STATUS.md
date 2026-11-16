@@ -11,7 +11,7 @@
 - On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
 - pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
-- The latest request was to use Zig standard-library Linux APIs in the locking test. Preserve manual changes and do not commit or implement additional operations without a request.
+- The latest request was to remove automatic EINTR retries from flock acquisition for now. Preserve manual changes and do not commit or implement additional operations without a request.
 
 ## Goal and confirmed decisions
 
@@ -39,7 +39,7 @@
 - `docs/LINUX_FILESYSTEM_NOTES.md` retains generic Linux filesystem knowledge: inodes/names, open/VFS/FUSE, descriptors versus open instances, unlink lifetime, links, redirection/truncation, timestamps, directories, and atomicity versus durability; examples are not implementation-status claims.
 - `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
 - The formatter reserves a new file exclusively, locks it, initializes schema and root in one SQLite transaction, and refuses an existing path.
-- `src/database_lock.zig` acquires a nonblocking exclusive flock using `std.os.linux.flock`; format and mount hold its close-on-exec descriptor until after SQLite closes. Contention reports `DatabaseInUse`. Future embedded access must follow the same protocol.
+- `src/database_lock.zig` acquires a nonblocking exclusive flock using `std.os.linux.flock`; format and mount hold its close-on-exec descriptor until after SQLite closes. Contention reports `DatabaseInUse`; EINTR currently reports `DatabaseLock` without retry. Future embedded access must follow the same protocol.
 - Locking is advisory, assumes a stable database pathname and cooperating processes, and is intended for local filesystems. Direct SQLite users and file replacement can bypass it; network filesystem behavior is not guaranteed. Orphan recovery is not implemented.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
@@ -192,7 +192,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - After implementing mkdir, debug and ReleaseSafe builds passed. An authorized fresh temporary mount validated mkdir/mkdir -p, mode/umask, ownership, parent/child link counts, nested file I/O, duplicate/missing-parent/non-directory/long-name errors, setgid inheritance, and persistence after remount.
 - A trigger-injected parent-link-count update failure rolled back the new inode, directory entry and parent metadata; SQLite integrity/foreign-key checks passed and no directory content chunks were present.
 - Subagent delegation was requested where relevant; no subagent tool was available in this earlier session.
-- On `feature/database-locking`, debug and ReleaseSafe builds passed; `zig build test` exercised flock contention across a fork and independent descriptors, then reacquisition after close using an anonymous file. Expected contention diagnostics appear in test output. Builds and tests passed again after switching flock and test setup to `std.os.linux` APIs; the test still calls the production locking functions.
+- On `feature/database-locking`, debug and ReleaseSafe builds passed; `zig build test` exercised flock contention across a fork and independent descriptors, then reacquisition after close using an anonymous file. Expected contention diagnostics appear in test output. Builds and tests passed again after switching flock and test setup to `std.os.linux` APIs and removing the flock EINTR retry; EINTR itself was not injected.
 - Formatted a fresh database and verified integrity, foreign keys, and existing-file refusal without modification. The test database is retained at `/tmp/zqueel-lock-check-84aptv1z`; no mount/unmount or cleanup was performed. No actual mount-lifetime integration test was run.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 

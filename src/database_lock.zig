@@ -4,20 +4,18 @@ const c = @import("ffi");
 // This advisory lock coordinates cooperating zqueel-fs instances only. The
 // database pathname must remain stable while SQLite and this descriptor are open.
 pub fn acquire(fd: c_int, path: [:0]const u8) !void {
-    while (true) {
-        const result = std.os.linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
-        switch (std.os.linux.errno(result)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .AGAIN => {
-                std.debug.print("Database is already in use: {s}\n", .{path});
-                return error.DatabaseInUse;
-            },
-            else => |errno| {
-                std.debug.print("Cannot lock database: {s} (errno {d})\n", .{ path, @intFromEnum(errno) });
-                return error.DatabaseLock;
-            },
-        }
+    const result = std.os.linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    // EINTR is reported as a lock error for now; revisit retries with shutdown handling.
+    switch (std.os.linux.errno(result)) {
+        .SUCCESS => return,
+        .AGAIN => {
+            std.debug.print("Database is already in use: {s}\n", .{path});
+            return error.DatabaseInUse;
+        },
+        else => |errno| {
+            std.debug.print("Cannot lock database: {s} (errno {d})\n", .{ path, @backingInt(errno) });
+            return error.DatabaseLock;
+        },
     }
 }
 
