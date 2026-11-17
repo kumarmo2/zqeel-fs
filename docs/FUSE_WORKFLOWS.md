@@ -33,6 +33,30 @@ sequenceDiagram
 - Subsequent reads use the inode and handle. They do not need to resolve the original name again.
 - The diagram collapses libfuse's low-level dispatch into our callback participant. We still use libfuse in userspace; this is not a kernel driver.
 
+## Low-level replies and lookup references
+
+Each low-level request needs the appropriate reply. The reply communicates the result to the kernel; our lookup-reference accounting separately records inode references the kernel receives.
+
+| Callback | Successful reply | What it returns |
+|---|---|---|
+| `lookup`, `mknod`, `mkdir`, `symlink`, `link` | `fuse_reply_entry` | Inode and attributes |
+| `create` | `fuse_reply_create` | Entry plus open-handle information |
+| `getattr`, `setattr` | `fuse_reply_attr` | Attributes |
+| `open`, `opendir` | `fuse_reply_open` | Open-handle information |
+| `read`, `readdir` | `fuse_reply_buf` | Bytes or directory-entry buffer |
+| `write` | `fuse_reply_write` | Number of bytes written |
+| `release`, `releasedir` | `fuse_reply_err(req, 0)` | Success without a payload |
+| `forget` | `fuse_reply_none` | No ordinary response payload |
+
+This lists reply types, not a claim that every operation is implemented: `mknod`, `symlink`, and `link` are currently unsupported. On failure, callbacks normally use `fuse_reply_err(req, positive_errno)` instead of their success reply; `forget` uses `fuse_reply_none`.
+
+A successful positive `fuse_reply_entry` or `fuse_reply_create` establishes one kernel lookup reference, so we account for it in memory. Our `replyEntry` reserves/increments the count before sending and undoes it if the reply fails; `create` does the same using `fuse_reply_create`. The kernel later sends `forget(inode, count)` when it drops references. A negative lookup reply does not reference an inode. Ordinary writes use an already-known inode and **do not increase lookup counts**.
+
+```text
+lookup(parent, name) -> find inode -> account for reference -> reply with entry
+write(inode, bytes)  -> write data  -> reply with byte count
+```
+
 ## Previous: high-level FUSE open and read
 
 The kernel sends inode/node-ID-based FUSE protocol requests with either API. The high-level libfuse layer maintains its own name/parent mappings and translates requests into pathname callbacks for our Zig code.

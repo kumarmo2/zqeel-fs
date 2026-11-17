@@ -8,6 +8,10 @@ const allocator = std.heap.page_allocator;
 // Single-threaded session; SQLite and runtime state stay alive through teardown.
 var live: runtime.Runtime = undefined;
 
+// translate-c treats fuse_file_info as opaque because it contains C bitfields.
+// Locate a scalar field by its header-derived byte offset and return a pointer
+// without assuming alignment stronger than one byte. The caller must pair the
+// correct field type with its offset and use fi only while libfuse keeps it valid.
 fn field(comptime T: type, fi: *c.struct_fuse_file_info, offset: usize) *align(1) T {
     const bytes: [*]u8 = @ptrCast(fi);
     return @ptrCast(bytes + offset);
