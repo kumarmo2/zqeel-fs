@@ -1,6 +1,6 @@
 # Unlink: steps, nlink, and inode lifetime
 
-**Status:** design and explanation, not implemented behavior. zqueel-fs currently has no unlink callback, open-handle tracking, or low-level FUSE adapter. The selected direction is Linux-style unlink lifetime using libfuse's low-level API. Crash-orphan recovery policy is still unresolved.
+**Status:** unlink and reclamation are design/explanation only, not implemented behavior. The low-level FUSE adapter, open-handle tracking, and lookup-reference accounting now exist, preserving existing operations. The selected next direction is Linux-style unlink lifetime; crash-orphan recovery policy is still unresolved.
 
 ## 1. What unlink removes
 
@@ -56,7 +56,7 @@ Directories have different accounting: our current convention starts them at 2 a
 
 ## 3. Three counts with different jobs
 
-The planned low-level adapter must distinguish:
+The current low-level adapter distinguishes these counts; unlink will use them for reclamation:
 
 | Count | Stored where | Meaning |
 |---|---|---|
@@ -89,7 +89,7 @@ parent inode = 10
 name = "report.txt"
 ```
 
-In the planned low-level API, our callback receives `unlink(request, parent_inode, name)`, not the full path. FUSE node IDs must map consistently to database inode IDs.
+The planned unlink callback in our low-level adapter receives `unlink(request, parent_inode, name)`, not the full path. FUSE node IDs must map consistently to database inode IDs.
 
 ### Step 2 — Validate the request
 
@@ -130,21 +130,21 @@ The current mount is single-threaded. Any future concurrent implementation must 
 
 ### Step 5 — Commit, then report success
 
-Commit the transaction before sending a successful low-level reply (`fuse_reply_err(request, 0)`). Errors use a positive errno in low-level replies, unlike our current high-level callbacks' negative return values.
+Commit the transaction before sending a successful low-level reply (`fuse_reply_err(request, 0)`). Errors use a positive errno in low-level replies; our internal storage helpers still return negative errno and the adapter converts them.
 
 After success, a fresh lookup of the removed name fails unless someone has recreated it. Existing descriptors still identify the old inode.
 
 ### Step 6 — Continue serving live references
 
-After migration to inode-based dispatch, an open unlinked file must still support our existing read, write, truncation, metadata-read, and timestamp-update functionality through its live references.
+Once unlink is added, an open unlinked file must still support our existing read, write, truncation, metadata-read, and timestamp-update functionality through its live references.
 
-The migrated operations use inode identity/open state rather than looking up the removed path. A descriptor metadata query reports nlink=0 after the final name is removed.
+The migrated operations already use inode identity/open state rather than looking up a path. A descriptor metadata query reports nlink=0 after the final name is removed.
 
 Recreating the same pathname creates a different inode. Never redirect an old handle to the new object by resolving the pathname again.
 
 ### Step 7 — Reclaim after the final references disappear
 
-Both `release` and `forget` call a shared reclamation check after reducing their respective counts. Do not assume a particular arrival order.
+Once reclamation is implemented, both `release` and `forget` must call a shared reclamation check after reducing their respective counts. Do not assume a particular arrival order.
 
 When all three counts are zero, transactionally delete chunks and then the inode. Retain enough bookkeeping to retry failed cleanup and log failures: `release` errors are not a reliable way to report deletion problems to the application, and `forget` has no ordinary error reply.
 
@@ -161,13 +161,13 @@ flowchart TD
 
 Closing one descriptor does not necessarily reach the last step. Other opens, shared descriptors, mappings, or kernel lookup references may still retain the object.
 
-## 6. What we must implement first in zqueel-fs
+## 6. Implementation progress and remaining work
 
-1. Separate reusable inode-based storage operations from the current pathname callbacks. Reuse existing chunk read/write, resize, and timestamp logic.
-2. Migrate the mount's adapter from high-level to low-level FUSE while preserving existing operations. This is a session-wide interface change, not replacing only `open`.
-3. Add lookup-reference accounting and checked `fi->fh` access, handle allocation, open-reference accounting, `release`, and `forget`.
-4. Add the unlink transaction and shared reclamation helper described above.
-5. Account for shutdown: the kernel does not guarantee an individual `forget` for every reference on unmount.
+1. **Done:** reusable inode-based SQLite operations in `src/store.zig`, reusing the chunk read/write logic and combining resize/timestamp changes.
+2. **Done:** migration of the session-wide adapter to low-level FUSE while preserving existing operations.
+3. **Done:** lookup/open-reference accounting in `src/runtime.zig`, header-derived `fi->fh` access, handles, `release`, and `forget`. These callbacks do not reclaim persistent objects yet.
+4. **Pending:** the unlink transaction and shared reclamation helper described above.
+5. **Partly done:** session teardown frees volatile state without assuming final forget/release callbacks. Persistent zero-link cleanup at shutdown remains part of the future reclamation/recovery design.
 6. Decide crash recovery separately. A crash can leave persistent zero-link inodes while volatile reference maps disappear. The advisory database flock alone does not justify automatic orphan deletion: cooperating access and stable-path assumptions still matter.
 
 No schema change appears necessary for the basic lifecycle. Do not implement startup orphan deletion before its recovery policy is settled.

@@ -1,6 +1,6 @@
 # SQLite functions used by zqueel-fs
 
-This is a guide to the SQLite C API calls currently used by `src/main.zig` and `src/mount.zig`. Zig accesses them through the translated declarations in `src/ffi.h`. It describes what the code does today, not a promise of complete error handling or production readiness. Consult the [SQLite C API reference](https://www.sqlite.org/c3ref/intro.html) for the full contracts.
+This is a guide to the SQLite C API calls currently used by `src/main.zig`, `src/mount.zig`, and the inode-based operations in `src/store.zig` (excluding test-only helpers). Zig accesses them through the translated declarations in `src/ffi.h`. It describes what the code does today, not a promise of complete error handling or production readiness. Consult the [SQLite C API reference](https://www.sqlite.org/c3ref/intro.html) for the full contracts.
 
 The names below are C functions. SQLite types (`sqlite3`, `sqlite3_stmt`) and constants such as `SQLITE_OK` are not functions. The SQL function `last_insert_rowid()` is covered separately at the end.
 
@@ -38,7 +38,7 @@ Returns a human-readable message for the connection's most recent error. SQLite 
 
 ### `sqlite3_errcode`
 
-Returns the connection's most recent error code. `src/mount.zig` maps selected SQLite errors to filesystem errno values, masking to the primary code. Read the error promptly: later SQLite calls can change the connection's error state. See [`sqlite3_errcode`](https://www.sqlite.org/c3ref/errcode.html).
+Returns the connection's most recent error code. `src/store.zig` maps selected SQLite errors to filesystem errno values, masking to the primary code. Read the error promptly: later SQLite calls can change the connection's error state. See [`sqlite3_errcode`](https://www.sqlite.org/c3ref/errcode.html).
 
 ## Prepared statements and parameters
 

@@ -33,5 +33,7 @@
 - `schema.sql`: reviewable proposed v1 schema.
 - `docs/STATUS.md`: project bookkeeping and continuation notes, including the paused unlink/open-handle design discussion.
 - `docs/LINUX_FILESYSTEM_NOTES.md`: generic Linux concepts; illustrative designs are not implemented-feature claims.
-- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
+- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental low-level FUSE adapter; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
+- `src/store.zig`: inode-based SQLite operations; `src/runtime.zig`: volatile handles, lookup/open references, and directory snapshot ownership. No persistent inode reclamation yet.
+- `src/store_tests.zig`: in-memory regression tests. `tests/lowlevel_smoke.py`: explicit-authorized unprivileged mount/unmount smoke test; retains fresh run artifacts.
 - `build.zig`, `build.zig.zon`: Zig 0.17 executable configuration with SQLite and libfuse3 linkage.

@@ -30,6 +30,18 @@ pub fn build(b: *std.Build) void {
     lock_tests.root_module.addImport("ffi", ffi.createModule());
     lock_tests.root_module.link_libc = true;
     const run_lock_tests = b.addRunArtifact(lock_tests);
-    const test_step = b.step("test", "Run database ownership tests");
+    const fs_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/store_tests.zig"),
+        .optimize = optimize,
+        .target = target,
+    }) });
+    fs_tests.root_module.addImport("ffi", ffi.createModule());
+    fs_tests.root_module.addAnonymousImport("schema.sql", .{ .root_source_file = b.path("schema.sql") });
+    fs_tests.root_module.link_libc = true;
+    fs_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    fs_tests.root_module.linkSystemLibrary("fuse3", .{});
+    const run_fs_tests = b.addRunArtifact(fs_tests);
+    const test_step = b.step("test", "Run database ownership and in-memory filesystem tests");
     test_step.dependOn(&run_lock_tests.step);
+    test_step.dependOn(&run_fs_tests.step);
 }
