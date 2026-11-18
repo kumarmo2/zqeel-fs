@@ -7,6 +7,8 @@ const allocator = std.heap.page_allocator;
 
 // Single-threaded session; SQLite and runtime state stay alive through teardown.
 var live: runtime.Runtime = undefined;
+// Only inodes whose last name was removed by this session belong here.
+var pending_reclaims: std.AutoHashMap(i64, void) = undefined;
 
 // translate-c treats fuse_file_info as opaque because it contains C bitfields.
 // Locate a scalar field by its header-derived byte offset and return a pointer
@@ -102,12 +104,27 @@ fn forget(req: c.fuse_req_t, ino: c.fuse_ino_t, count: u64) callconv(.c) void {
     if (builtin.mode == .debug) {
         std.debug.print("[fuse] forget inode={d} count={d}\n", .{ ino, count });
     }
-    if (store.fromFuse(ino)) |id| {
-        if (!live.forget(id, count)) {
-            std.debug.print("FUSE lookup reference underflow: inode={d} count={d}\n", .{ ino, count });
-        }
+    dropLookup(ino, count);
+    c.fuse_reply_none(req);
+}
+
+fn forgetMulti(req: c.fuse_req_t, count: usize, items: [*c]c.struct_fuse_forget_data) callconv(.c) void {
+    if (builtin.mode == .debug) {
+        std.debug.print("[fuse] forget_multi count={d}\n", .{count});
+    }
+    for (items[0..count]) |item| {
+        dropLookup(item.ino, item.nlookup);
     }
     c.fuse_reply_none(req);
+}
+
+fn dropLookup(ino: c.fuse_ino_t, count: u64) void {
+    const id = store.fromFuse(ino) orelse return;
+    if (!live.forget(id, count)) {
+        std.debug.print("FUSE lookup reference underflow: inode={d} count={d}\n", .{ ino, count });
+        return;
+    }
+    tryReclaim(id);
 }
 
 fn getattr(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
@@ -318,7 +335,12 @@ fn closeHandle(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_in
         replyStatus(req, -c.EBADF);
         return;
     };
-    replyStatus(req, if (live.close(handleId(info), id, kind)) 0 else -c.EBADF);
+    if (!live.close(handleId(info), id, kind)) {
+        replyStatus(req, -c.EBADF);
+        return;
+    }
+    tryReclaim(id);
+    replyStatus(req, 0);
 }
 
 fn appendEntry(entries: *std.ArrayList(runtime.DirEntry), name: []const u8, id: i64, mode: u32) !void {
@@ -433,6 +455,75 @@ fn readdir(req: c.fuse_req_t, ino: c.fuse_ino_t, size: usize, off: c.off_t, fi: 
     _ = c.fuse_reply_buf(req, buf.ptr, used);
 }
 
+fn unlink(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
+    const name_slice = std.mem.span(name);
+    if (builtin.mode == .debug) {
+        std.debug.print("[fuse] unlink parent={d} name=\"{s}\"\n", .{ parent, name_slice });
+    }
+    const id = dbInode(req, parent) orelse return;
+    // A committed unlink must be trackable even if later allocations fail.
+    pending_reclaims.ensureUnusedCapacity(1) catch {
+        replyStatus(req, -c.ENOMEM);
+        return;
+    };
+    const deferred = store.unlinkName(id, name_slice, hasReferences) catch |err| {
+        replyStatus(req, unlinkErrno(err));
+        return;
+    };
+    if (deferred) |target| {
+        pending_reclaims.putAssumeCapacity(target, {});
+    }
+    replyStatus(req, 0);
+}
+
+fn unlinkErrno(err: store.UnlinkError) c_int {
+    return switch (err) {
+        error.NotFound => c.ENOENT,
+        error.NotDirectory => c.ENOTDIR,
+        error.IsDirectory => c.EISDIR,
+        error.InvalidName => c.EINVAL,
+        error.NameTooLong => c.ENAMETOOLONG,
+        error.Busy => c.EBUSY,
+        error.DiskFull => c.ENOSPC,
+        error.OutOfMemory => c.ENOMEM,
+        error.ReadOnly => c.EROFS,
+        error.AccessDenied => c.EACCES,
+        error.Io => c.EIO,
+    };
+}
+
+fn hasReferences(id: i64) bool {
+    const refs = live.refs.get(id) orelse return false;
+    return refs.opens != 0 or refs.lookups != 0;
+}
+
+fn tryReclaim(id: i64) void {
+    if (pending_reclaims.contains(id) and !hasReferences(id) and reclaim(id)) {
+        _ = pending_reclaims.remove(id);
+    }
+}
+
+fn reclaim(id: i64) bool {
+    store.reclaimUnlinkedFile(id) catch |err| {
+        std.debug.print("FUSE could not reclaim unlinked inode {d}: {s}\n", .{ id, @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
+fn reclaimAfterSession() bool {
+    // The session is gone. The kernel may not have delivered all releases or
+    // forgets. Retry only inodes recorded by this session, never old orphans.
+    var ok = true;
+    var it = pending_reclaims.keyIterator();
+    while (it.next()) |id| {
+        if (!reclaim(id.*)) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 fn releasedir(req: c.fuse_req_t, ino: c.fuse_ino_t, fi: ?*c.struct_fuse_file_info) callconv(.c) void {
     if (builtin.mode == .debug) {
         std.debug.print("[fuse] releasedir inode={d} fi={any}\n", .{ ino, fi });
@@ -476,10 +567,22 @@ pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
     }
     live = runtime.Runtime.init(allocator);
     defer live.deinit();
+    pending_reclaims = .init(allocator);
+    defer pending_reclaims.deinit();
+    const session_result = runSession(mountpoint);
+    const reclaimed = reclaimAfterSession();
+    try session_result;
+    if (!reclaimed) {
+        return error.ReclamationFailed;
+    }
+}
+
+fn runSession(mountpoint: [:0]const u8) !void {
     var ops = std.mem.zeroes(c.struct_fuse_lowlevel_ops);
     ops.init = init;
     ops.lookup = lookup;
     ops.forget = forget;
+    ops.forget_multi = forgetMulti;
     ops.getattr = getattr;
     ops.setattr = setattr;
     ops.open = open;
@@ -491,6 +594,7 @@ pub fn mount(path: [:0]const u8, mountpoint: [:0]const u8) !void {
     ops.opendir = opendir;
     ops.readdir = readdir;
     ops.releasedir = releasedir;
+    ops.unlink = unlink;
 
     // Foreground, single-threaded: mountpoint is separate from session options.
     var argv = [_][*c]u8{ @constCast("zqueel-fs"), @constCast("-o"), @constCast("default_permissions") };

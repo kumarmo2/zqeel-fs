@@ -86,6 +86,10 @@ Read a column from the current result row as a 32-bit or signed 64-bit integer. 
 
 A null pointer can represent SQL `NULL` or a zero-length BLOB, not only an allocation failure. A zero byte count also does not distinguish those cases. See [result-column access and pointer lifetimes](https://www.sqlite.org/c3ref/column_blob.html).
 
+### `sqlite3_changes`
+
+Returns the number of rows directly inserted, updated, or deleted by the most recent completed INSERT, UPDATE, or DELETE on the connection. Unlink checks the result after each single-row mutation to detect unexpected state; changes made by triggers are not counted. See [`sqlite3_changes`](https://www.sqlite.org/c3ref/changes.html).
+
 ## Inserted row identity
 
 ### `sqlite3_last_insert_rowid`

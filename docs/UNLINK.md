@@ -1,6 +1,6 @@
 # Unlink: steps, nlink, and inode lifetime
 
-**Status:** unlink and reclamation are design/explanation only, not implemented behavior. The low-level FUSE adapter, open-handle tracking, and lookup-reference accounting now exist, preserving existing operations. The selected next direction is Linux-style unlink lifetime; crash-orphan recovery policy is still unresolved.
+**Status:** regular-file unlink and reclamation of files unlinked by the current mount are implemented. Startup orphan recovery, `rmdir`, and hard-link creation remain unimplemented.
 
 ## 1. What unlink removes
 
@@ -70,7 +70,7 @@ The current low-level adapter distinguishes these counts; unlink will use them f
 - An `O_PATH` descriptor may retain an inode without an ordinary FUSE `open` handle. Open counts alone are insufficient.
 - `flush` is not final release and must not be used as the reclamation signal.
 
-For the planned regular-file implementation, reclaim only when:
+The regular-file implementation reclaims only when:
 
 ```text
 nlink == 0 AND open_refs == 0 AND lookup_refs == 0
@@ -89,7 +89,7 @@ parent inode = 10
 name = "report.txt"
 ```
 
-The planned unlink callback in our low-level adapter receives `unlink(request, parent_inode, name)`, not the full path. FUSE node IDs must map consistently to database inode IDs.
+The unlink callback in our low-level adapter receives `unlink(request, parent_inode, name)`, not the full path. FUSE node IDs must map consistently to database inode IDs.
 
 ### Step 2 — Validate the request
 
@@ -136,7 +136,7 @@ After success, a fresh lookup of the removed name fails unless someone has recre
 
 ### Step 6 — Continue serving live references
 
-Once unlink is added, an open unlinked file must still support our existing read, write, truncation, metadata-read, and timestamp-update functionality through its live references.
+An open unlinked file still supports our existing read, write, truncation, metadata-read, and timestamp-update functionality through its live references.
 
 The migrated operations already use inode identity/open state rather than looking up a path. A descriptor metadata query reports nlink=0 after the final name is removed.
 
@@ -144,9 +144,9 @@ Recreating the same pathname creates a different inode. Never redirect an old ha
 
 ### Step 7 — Reclaim after the final references disappear
 
-Once reclamation is implemented, both `release` and `forget` must call a shared reclamation check after reducing their respective counts. Do not assume a particular arrival order.
+`release`, `forget`, and `forget_multi` call a shared reclamation check after dropping references. No particular arrival order is required.
 
-When all three counts are zero, transactionally delete chunks and then the inode. Retain enough bookkeeping to retry failed cleanup and log failures: `release` errors are not a reliable way to report deletion problems to the application, and `forget` has no ordinary error reply.
+When all three counts are zero, reclamation transactionally deletes chunks and then the inode. If that fails, the adapter logs the error and retains the inode ID for retry at shutdown. If the retry still fails, the mount command reports `ReclamationFailed` after session teardown.
 
 ## 5. Example: open, unlink, read, close
 
@@ -165,12 +165,12 @@ Closing one descriptor does not necessarily reach the last step. Other opens, sh
 
 1. **Done:** reusable inode-based SQLite operations in `src/store.zig`, reusing the chunk read/write logic and combining resize/timestamp changes.
 2. **Done:** migration of the session-wide adapter to low-level FUSE while preserving existing operations.
-3. **Done:** lookup/open-reference accounting in `src/runtime.zig`, header-derived `fi->fh` access, handles, `release`, and `forget`. These callbacks do not reclaim persistent objects yet.
-4. **Pending:** the unlink transaction and shared reclamation helper described above.
-5. **Partly done:** session teardown frees volatile state without assuming final forget/release callbacks. Persistent zero-link cleanup at shutdown remains part of the future reclamation/recovery design.
+3. **Done:** lookup/open-reference accounting in `src/runtime.zig`, header-derived `fi->fh` access, handles, `release`, and `forget`.
+4. **Done:** unlink transaction and shared reclamation, including the batched forget callback.
+5. **Done for current-session unlinks:** after session destruction, teardown reclaims pending zero-link files without assuming final forget/release callbacks. It does not scan for pre-existing orphans.
 6. Decide crash recovery separately. A crash can leave persistent zero-link inodes while volatile reference maps disappear. The advisory database flock alone does not justify automatic orphan deletion: cooperating access and stable-path assumptions still matter.
 
-No schema change appears necessary for the basic lifecycle. Do not implement startup orphan deletion before its recovery policy is settled.
+No schema change was required. Do not implement startup orphan deletion before its recovery policy is settled.
 
 ## 7. Validation checklist
 

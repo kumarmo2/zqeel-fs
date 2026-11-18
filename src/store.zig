@@ -6,6 +6,9 @@ pub var database: *c.sqlite3 = undefined;
 pub var root: i64 = undefined;
 pub var chunk_size: i64 = undefined;
 
+pub const file: i64 = c.S_IFREG;
+pub const inode_mode_mask: i64 = c.S_IFMT;
+
 pub const Node = struct {
     id: i64,
     mode: i64,
@@ -16,6 +19,10 @@ pub const Node = struct {
     atime: i64,
     mtime: i64,
     ctime: i64,
+
+    pub fn is_file(self: *Node) bool {
+        return (self.mode & inode_mode_mask) == file;
+    }
 };
 
 pub fn prepare(sql: [*:0]const u8) ?*c.sqlite3_stmt {
@@ -134,6 +141,145 @@ pub fn findChild(parent_id: i64, name: []const u8, found: *Node) c_int {
     }
     found.* = node(c.sqlite3_column_int64(stmt, 0)) catch |err| return nodeError(err);
     return 0;
+}
+
+pub const UnlinkError = error{
+    NotFound,
+    NotDirectory,
+    IsDirectory,
+    InvalidName,
+    NameTooLong,
+    Busy,
+    DiskFull,
+    OutOfMemory,
+    ReadOnly,
+    AccessDenied,
+    Io,
+};
+
+fn unlinkError(status: c_int) UnlinkError {
+    return switch (status) {
+        -c.ENOENT => error.NotFound,
+        -c.ENOTDIR => error.NotDirectory,
+        -c.EINVAL => error.InvalidName,
+        -c.ENAMETOOLONG => error.NameTooLong,
+        -c.EBUSY => error.Busy,
+        -c.ENOSPC => error.DiskFull,
+        -c.ENOMEM => error.OutOfMemory,
+        -c.EROFS => error.ReadOnly,
+        -c.EACCES => error.AccessDenied,
+        else => error.Io,
+    };
+}
+
+// Remove one name atomically. Return a zero-link inode ID only if the caller
+// still has references to it. The predicate must not mutate the database or
+// runtime references; the single-threaded caller keeps that state stable.
+pub fn unlinkName(parent_id: i64, name: []const u8, hasReferences: *const fn (i64) bool) UnlinkError!?i64 {
+    const valid = validateName(name);
+    if (valid != 0) {
+        return unlinkError(valid);
+    }
+    if (c.sqlite3_exec(database, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
+        return unlinkError(sqliteError());
+    }
+    errdefer _ = c.sqlite3_exec(database, "ROLLBACK", null, null, null);
+
+    var target: Node = undefined;
+    const found = findChild(parent_id, name, &target);
+    if (found != 0) {
+        return unlinkError(found);
+    }
+    if ((target.mode & inode_mode_mask) == c.S_IFDIR) {
+        return error.IsDirectory;
+    }
+    if (!target.is_file() or target.id == root or target.links <= 0) {
+        return error.Io;
+    }
+    const now = nowNs() orelse return error.Io;
+
+    const remove = prepare("DELETE FROM dirents WHERE parent_inode=? AND name=? AND target_inode=?") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(remove);
+    if (c.sqlite3_bind_int64(remove, 1, parent_id) != c.SQLITE_OK or
+        c.sqlite3_bind_blob(remove, 2, name.ptr, @intCast(name.len), c.SQLITE_TRANSIENT) != c.SQLITE_OK or
+        c.sqlite3_bind_int64(remove, 3, target.id) != c.SQLITE_OK)
+    {
+        return unlinkError(sqliteError());
+    }
+    try changeOne(remove);
+
+    // The reverse index supports checking remaining names. A mismatched
+    // count must not leave behind a nameless inode with a positive nlink.
+    const update = prepare("UPDATE inodes SET nlink=nlink-1,ctime_ns=? WHERE inode_id=? AND nlink=? AND nlink-1=(SELECT count(*) FROM dirents WHERE target_inode=inodes.inode_id)") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(update);
+    try bindIntegers(update, &.{ now, target.id, target.links });
+    try changeOne(update);
+
+    const parent = prepare("UPDATE inodes SET mtime_ns=?,ctime_ns=? WHERE inode_id=?") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(parent);
+    try bindIntegers(parent, &.{ now, now, parent_id });
+    try changeOne(parent);
+
+    var deferred: ?i64 = null;
+    if (target.links == 1) {
+        if (hasReferences(target.id)) {
+            deferred = target.id;
+        } else {
+            try deleteUnlinkedFile(target.id);
+        }
+    }
+    if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) {
+        return unlinkError(sqliteError());
+    }
+    return deferred;
+}
+
+fn bindIntegers(stmt: *c.sqlite3_stmt, values: []const i64) UnlinkError!void {
+    for (values, 1..) |value, index| {
+        if (c.sqlite3_bind_int64(stmt, @intCast(index), value) != c.SQLITE_OK) {
+            return unlinkError(sqliteError());
+        }
+    }
+}
+
+fn changeOne(stmt: *c.sqlite3_stmt) UnlinkError!void {
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+        return unlinkError(sqliteError());
+    }
+    if (c.sqlite3_changes(database) != 1) {
+        return error.Io;
+    }
+}
+
+// Caller owns the transaction and has already established that no live
+// references remain. The guarded inode delete protects against stale IDs;
+// a failed guard rolls back any chunk deletion as well.
+fn deleteUnlinkedFile(id: i64) UnlinkError!void {
+    if (id == root) {
+        return error.Io;
+    }
+    const chunks = prepare("DELETE FROM file_chunks WHERE inode_id=?") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(chunks);
+    try bindIntegers(chunks, &.{id});
+    if (c.sqlite3_step(chunks) != c.SQLITE_DONE) {
+        return unlinkError(sqliteError());
+    }
+    const inode = prepare("DELETE FROM inodes WHERE inode_id=? AND nlink=0 AND (mode & ?)=? AND NOT EXISTS(SELECT 1 FROM dirents WHERE target_inode=inodes.inode_id)") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(inode);
+    try bindIntegers(inode, &.{ id, inode_mode_mask, file });
+    try changeOne(inode);
+}
+
+// Used only for zero-link files recorded by the current mount, not startup recovery.
+pub fn reclaimUnlinkedFile(id: i64) UnlinkError!void {
+    if (c.sqlite3_exec(database, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
+        return unlinkError(sqliteError());
+    }
+    errdefer _ = c.sqlite3_exec(database, "ROLLBACK", null, null, null);
+    try deleteUnlinkedFile(id);
+    if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) {
+        return unlinkError(sqliteError());
+    }
 }
 
 pub fn attributes(n: Node) c.struct_stat {

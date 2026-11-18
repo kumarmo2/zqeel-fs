@@ -1,6 +1,6 @@
 # FUSE workflows: current low-level and previous high-level APIs
 
-The current implementation uses libfuse3's low-level, inode-oriented API. Existing file/directory operations were migrated, including open handles, lookup-reference accounting, and per-open directory snapshots. **Unlink and inode reclamation remain unimplemented.** The previous high-level workflow is retained below for comparison.
+The current implementation uses libfuse3's low-level, inode-oriented API. Existing file/directory operations were migrated, including open handles, lookup-reference accounting, and per-open directory snapshots. Regular-file unlink and session-local reclamation are implemented; startup orphan recovery is not. The previous high-level workflow is retained below for comparison.
 
 These diagrams are conceptual request flows, not runtime traces. They omit permissions, some metadata requests, and error handling. Cached names or data can avoid requests shown here. In the previous high-level API, callback paths were relative to the FUSE mount root: `/mnt/docs/report.txt` became `/docs/report.txt` when mounted at `/mnt`. Current low-level callbacks receive inode IDs or parent/name pairs, not full paths.
 
@@ -45,7 +45,7 @@ Each low-level request needs the appropriate reply. The reply communicates the r
 | `open`, `opendir` | `fuse_reply_open` | Open-handle information |
 | `read`, `readdir` | `fuse_reply_buf` | Bytes or directory-entry buffer |
 | `write` | `fuse_reply_write` | Number of bytes written |
-| `release`, `releasedir` | `fuse_reply_err(req, 0)` | Success without a payload |
+| `unlink`, `release`, `releasedir` | `fuse_reply_err(req, 0)` | Success without a payload |
 | `forget` | `fuse_reply_none` | No ordinary response payload |
 
 This lists reply types, not a claim that every operation is implemented: `mknod`, `symlink`, and `link` are currently unsupported. On failure, callbacks normally use `fuse_reply_err(req, positive_errno)` instead of their success reply; `forget` uses `fuse_reply_none`.
@@ -109,11 +109,11 @@ The application still uses an FD for reads. It is libfuse's high-level adapter t
 | Open-file reads | Our callback resolves the supplied path again | Our callback uses inode + open handle |
 | Open state | No private handle tracking | Handle-to-inode state and open references |
 | Kernel inode references | Managed internally by high-level libfuse | Our adapter accounts for entry replies and `forget` |
-| Unlink | Not implemented | Still pending; will remove the name and retain referenced inodes |
+| Unlink | Not implemented | Removes the name and retains referenced inodes |
 
-High-level libfuse normally handles deletion of an open file by renaming it to a `.fuse_hidden…` name and deleting that name after release. The previous adapter had no rename callback, so that mechanism was not a working unlink solution. The current low-level adapter does not use high-level hiding, but still needs an unlink transaction and explicit reclamation.
+High-level libfuse normally handles deletion of an open file by renaming it to a `.fuse_hidden…` name and deleting that name after release. The previous adapter had no rename callback, so that mechanism was not a working unlink solution. The current low-level adapter uses a SQLite unlink transaction and explicit reclamation instead of hidden names.
 
-With the planned low-level design, removing `report.txt` deletes its directory entry but leaves inode 42 usable through existing references. Recreating `report.txt` creates a different inode; old descriptors must not switch to it.
+With the current low-level adapter, removing `report.txt` deletes its directory entry but leaves inode 42 usable through existing references. Recreating `report.txt` creates a different inode; old descriptors must not switch to it.
 
 For regular files, final reclamation requires all three to be zero: persistent `nlink`, runtime open references, and runtime kernel lookup references. Crash-leftover recovery still needs a separate policy.
 
@@ -121,7 +121,7 @@ For regular files, final reclamation requires all three to be zero: persistent `
 
 - `src/mount.zig` registers `fuse_lowlevel_ops` through `fuse_session_new_fn`, mounts, and runs the single-threaded session loop; the database lock remains held through teardown.
 - `src/store.zig` implements inode-based SQLite operations. `setattr` combines resizing and timestamp changes in one transaction. General chmod/chown remain unsupported.
-- `src/runtime.zig` tracks handles and separate lookup/open references. `release` and `forget` update volatile state only; they do not delete persistent rows.
+- `src/runtime.zig` tracks handles and separate lookup/open references. `release`, `forget`, and `forget_multi` update volatile counts and can reclaim tracked zero-link inodes when both counts reach zero.
 - Directory handles keep immutable snapshots with index-based continuation cookies. Reopen a directory to see entries created after its snapshot.
 - Writeback caching stays disabled. Writes use current request flags, so `fcntl` changes to O_APPEND and mmap write offsets are not overridden by stale open-time flags.
 - Debug-only traces now show inode IDs or parent/name pairs. A full pathname is no longer supplied to the callbacks.

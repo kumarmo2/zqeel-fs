@@ -213,10 +213,59 @@ try:
     assert b"nonutf8-\xff" in os.listdir(os.fsencode(MOUNT))
     expect_error(lambda: os.chmod(file, 0o600), {errno.ENOSYS, errno.EOPNOTSUPP})
     expect_error(lambda: os.link(file, MOUNT / "hardlink"), {errno.ENOSYS, errno.EOPNOTSUPP, errno.EPERM})
+    closed = directory / "unlink-closed"
+    closed.write_bytes(b"discard")
+    closed_ino = closed.stat().st_ino
+    subprocess.run(["rm", "--", closed], check=True)
+    expect_error(closed.stat, {errno.ENOENT})
+    expect_error(closed.unlink, {errno.ENOENT})
+    expect_error(directory.unlink, {errno.EISDIR})
+
+    opened = directory / "unlink-open"
+    opened.write_bytes(b"old")
+    first = os.open(opened, os.O_RDWR)
+    second = os.open(opened, os.O_RDWR)
+    duplicate = os.dup(first)
+    old_ino = os.fstat(first).st_ino
+    try:
+        opened.unlink()
+        expect_error(opened.stat, {errno.ENOENT})
+        assert os.fstat(first).st_nlink == 0
+        assert os.pread(second, 3, 0) == b"old"
+        opened.write_bytes(b"replacement")
+        assert opened.stat().st_ino != old_ino
+        os.pwrite(duplicate, b"!", 3)
+        os.ftruncate(second, 4)
+        assert os.fstat(second).st_size == 4
+        assert os.pread(first, 4, 0) == b"old!"
+        assert opened.read_bytes() == b"replacement"
+    finally:
+        os.close(first)
+        try:
+            assert os.pread(duplicate, 4, 0) == b"old!"
+        finally:
+            os.close(duplicate)
+            os.close(second)
+
+    path_only = directory / "unlink-opath"
+    path_only.write_bytes(b"data")
+    fd = os.open(path_only, os.O_PATH)
+    try:
+        path_ino = os.fstat(fd).st_ino
+        path_only.unlink()
+        # Bypass the attribute cache to ensure the inode is still readable by FUSE.
+        time.sleep(1.1)
+        assert os.fstat(fd).st_nlink == 0
+    finally:
+        os.close(fd)
+
     persisted = file.read_bytes()
     stop()
 
     with sqlite3.connect(DB) as db:
+        for removed in (closed_ino, old_ino, path_ino):
+            assert db.execute("SELECT 1 FROM inodes WHERE inode_id=?", (removed,)).fetchone() is None
+            assert db.execute("SELECT 1 FROM file_chunks WHERE inode_id=?", (removed,)).fetchone() is None
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert not db.execute("PRAGMA foreign_key_check").fetchall()
         assert db.execute("SELECT count(*) FROM inodes i WHERE i.inode_id<>1 AND NOT EXISTS(SELECT 1 FROM dirents d WHERE d.target_inode=i.inode_id)").fetchone() == (0,)
@@ -228,10 +277,10 @@ try:
     logs = (RUN / "mount-1.log").read_bytes()
     # The kernel may retain lookup references until unmount and omit final forgets.
     # Forget accounting is covered by the in-memory runtime tests, not log timing.
-    for callback in ("lookup", "getattr", "setattr", "open", "create", "mkdir", "read", "write", "release", "opendir", "readdir", "releasedir"):
+    for callback in ("lookup", "getattr", "setattr", "open", "create", "mkdir", "read", "write", "release", "opendir", "readdir", "releasedir", "unlink"):
         assert f"[fuse] {callback} ".encode() in logs, callback
     assert b"underflow" not in logs
-    print("PASS: existing operations, snapshots, rollback, persistence and Ctrl+C teardown", flush=True)
+    print("PASS: existing operations, unlink lifecycle, snapshots, rollback, persistence and Ctrl+C teardown", flush=True)
 finally:
     if process is not None:
         stop()

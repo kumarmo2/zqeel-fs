@@ -154,6 +154,119 @@ test "write and combined setattr rollback restore chunks and metadata" {
     try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM pragma_foreign_key_check"));
 }
 
+fn noReferences(_: i64) bool {
+    return false;
+}
+
+fn hasReferences(_: i64) bool {
+    return true;
+}
+
+test "unlink with other names preserves data, and the final unreferenced unlink reclaims it" {
+    try setup();
+    defer teardown();
+    try std.testing.expectEqual(@as(c_int, 3), fs.write(1, "old", 3, 0, 0));
+    try sql("INSERT INTO dirents VALUES(10,x'79',1); UPDATE inodes SET nlink=2,ctime_ns=7 WHERE inode_id=1;");
+    const before = try fs.node(1);
+    const parent_before = try fs.node(10);
+
+    try std.testing.expectEqual(@as(?i64, null), try fs.unlinkName(10, "x", noReferences));
+    var target: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, -c.ENOENT), fs.findChild(10, "x", &target));
+    try std.testing.expectEqual(@as(c_int, 0), fs.findChild(10, "y", &target));
+    try std.testing.expectEqual(before.id, target.id);
+    try std.testing.expectEqual(@as(i64, 1), target.links);
+    try std.testing.expectEqual(before.size, target.size);
+    try std.testing.expectEqual(before.mtime, target.mtime);
+    try std.testing.expectEqual(before.atime, target.atime);
+    const parent_after = try fs.node(10);
+    try std.testing.expectEqual(parent_before.links, parent_after.links);
+    try std.testing.expect(target.ctime != before.ctime);
+    try std.testing.expectEqual(target.ctime, parent_after.ctime);
+    try std.testing.expectEqual(target.ctime, parent_after.mtime);
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM file_chunks WHERE inode_id=1"));
+
+    try std.testing.expectEqual(@as(?i64, null), try fs.unlinkName(10, "y", noReferences));
+    try std.testing.expectError(error.NotFound, fs.node(1));
+    try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM file_chunks"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM pragma_foreign_key_check"));
+}
+
+test "unlinked referenced inode can be used independently of a replacement name" {
+    try setup();
+    defer teardown();
+    try std.testing.expectEqual(@as(c_int, 3), fs.write(1, "old", 3, 0, 0));
+    try std.testing.expectEqual(@as(?i64, 1), try fs.unlinkName(10, "x", hasReferences));
+    try std.testing.expectEqual(@as(i64, 0), (try fs.node(1)).links);
+    try std.testing.expectError(error.NotFound, fs.unlinkName(10, "x", hasReferences));
+
+    var replacement: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "x", 0o644, false, 100, 200, &replacement));
+    try std.testing.expect(replacement.id != 1);
+    try std.testing.expectEqual(@as(c_int, 3), fs.write(replacement.id, "new", 3, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), fs.write(1, "!", 1, 3, 0));
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 4), fs.read(1, &buf, buf.len, 0));
+    try std.testing.expectEqualStrings("old!", buf[0..4]);
+    var attr = std.mem.zeroes(c.struct_stat);
+    attr.st_size = 2;
+    try std.testing.expectEqual(@as(c_int, 0), fs.setAttributes(1, &attr, c.FUSE_SET_ATTR_SIZE));
+
+    try fs.reclaimUnlinkedFile(1);
+    try std.testing.expectError(error.NotFound, fs.node(1));
+    try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM file_chunks WHERE inode_id=1"));
+    try std.testing.expectEqual(@as(c_int, 3), fs.read(replacement.id, &buf, buf.len, 0));
+    try std.testing.expectEqualStrings("new", buf[0..3]);
+}
+
+test "unlink rejects directories invalid names and inconsistent link counts" {
+    try setup();
+    defer teardown();
+    var dir: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "dir", 0o755, true, 100, 200, &dir));
+    try std.testing.expectError(error.IsDirectory, fs.unlinkName(10, "dir", noReferences));
+    try std.testing.expectError(error.InvalidName, fs.unlinkName(10, ".", noReferences));
+    try std.testing.expectError(error.NotDirectory, fs.unlinkName(1, "x", noReferences));
+    try std.testing.expectError(error.NotFound, fs.unlinkName(10, "absent", noReferences));
+    try sql("INSERT INTO dirents VALUES(10,x'79',1);");
+    try std.testing.expectError(error.Io, fs.unlinkName(10, "x", hasReferences));
+    try std.testing.expectEqual(@as(i64, 2), try scalar("SELECT count(*) FROM dirents WHERE target_inode=1"));
+    try std.testing.expectEqual(@as(i64, 1), (try fs.node(1)).links);
+    try sql("DELETE FROM dirents WHERE name=x'79'; UPDATE inodes SET nlink=2 WHERE inode_id=1;");
+    try std.testing.expectError(error.Io, fs.unlinkName(10, "x", noReferences));
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM dirents WHERE target_inode=1"));
+    try std.testing.expectEqual(@as(i64, 2), (try fs.node(1)).links);
+}
+
+test "unlink and deferred reclamation roll back on failure" {
+    try setup();
+    defer teardown();
+    try std.testing.expectEqual(@as(c_int, 3), fs.write(1, "old", 3, 0, 0));
+    const before = try fs.node(1);
+    const parent_before = try fs.node(10);
+
+    try sql("CREATE TRIGGER fail_unlink_parent BEFORE UPDATE ON inodes WHEN OLD.inode_id=10 BEGIN SELECT RAISE(ABORT,'injected'); END;");
+    try std.testing.expectError(error.Io, fs.unlinkName(10, "x", noReferences));
+    try std.testing.expectEqualDeep(before, try fs.node(1));
+    try std.testing.expectEqualDeep(parent_before, try fs.node(10));
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM dirents WHERE target_inode=1"));
+
+    try sql("DROP TRIGGER fail_unlink_parent; CREATE TRIGGER fail_reclaim BEFORE DELETE ON inodes WHEN OLD.inode_id=1 BEGIN SELECT RAISE(ABORT,'injected'); END;");
+    try std.testing.expectError(error.Io, fs.unlinkName(10, "x", noReferences));
+    try std.testing.expectEqualDeep(before, try fs.node(1));
+    try std.testing.expectEqualDeep(parent_before, try fs.node(10));
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM dirents WHERE target_inode=1"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM file_chunks WHERE inode_id=1"));
+
+    try std.testing.expectEqual(@as(?i64, 1), try fs.unlinkName(10, "x", hasReferences));
+    try std.testing.expectError(error.Io, fs.reclaimUnlinkedFile(1));
+    try std.testing.expectEqual(@as(i64, 0), (try fs.node(1)).links);
+    try std.testing.expectEqual(@as(i64, 1), try scalar("SELECT count(*) FROM file_chunks WHERE inode_id=1"));
+    try sql("DROP TRIGGER fail_reclaim;");
+    try fs.reclaimUnlinkedFile(1);
+    try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM file_chunks"));
+}
+
 test "privilege stripping is supported without general chmod" {
     try setup();
     defer teardown();
