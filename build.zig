@@ -22,26 +22,29 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    const lock_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/database_lock.zig"),
-        .optimize = optimize,
-        .target = target,
-    }) });
-    lock_tests.root_module.addImport("ffi", ffi.createModule());
-    lock_tests.root_module.link_libc = true;
-    const run_lock_tests = b.addRunArtifact(lock_tests);
-    const fs_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/store_tests.zig"),
-        .optimize = optimize,
-        .target = target,
-    }) });
-    fs_tests.root_module.addImport("ffi", ffi.createModule());
-    fs_tests.root_module.addAnonymousImport("schema.sql", .{ .root_source_file = b.path("schema.sql") });
-    fs_tests.root_module.link_libc = true;
-    fs_tests.root_module.linkSystemLibrary("sqlite3", .{});
-    fs_tests.root_module.linkSystemLibrary("fuse3", .{});
-    const run_fs_tests = b.addRunArtifact(fs_tests);
-    const test_step = b.step("test", "Run database ownership and in-memory filesystem tests");
-    test_step.dependOn(&run_lock_tests.step);
-    test_step.dependOn(&run_fs_tests.step);
+    const test_step = b.step("test", "Run database lock, storage, and runtime tests");
+    for ([_][]const u8{ "database_lock", "store", "runtime" }) |component| {
+        const implementation = b.createModule(.{
+            .root_source_file = b.path(b.fmt("src/{s}.zig", .{component})),
+            .optimize = optimize,
+            .target = target,
+        });
+        const suite = b.createModule(.{
+            .root_source_file = b.path(b.fmt("tests/{s}_test.zig", .{component})),
+            .optimize = optimize,
+            .target = target,
+        });
+        suite.addImport(component, implementation);
+        if (std.mem.eql(u8, component, "store")) {
+            const bindings = ffi.createModule();
+            implementation.addImport("ffi", bindings);
+            suite.addImport("ffi", bindings);
+            suite.addAnonymousImport("schema.sql", .{ .root_source_file = b.path("schema.sql") });
+            suite.link_libc = true;
+            suite.linkSystemLibrary("sqlite3", .{});
+            suite.linkSystemLibrary("fuse3", .{});
+        }
+        const artifact = b.addTest(.{ .name = b.fmt("{s}_test", .{component}), .root_module = suite });
+        test_step.dependOn(&b.addRunArtifact(artifact).step);
+    }
 }

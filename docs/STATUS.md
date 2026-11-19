@@ -59,7 +59,7 @@
 - `write` updates affected chunks, size, mtime and ctime in one SQLite transaction, supports append and sparse gaps, and clears setuid/setgid bits.
 - Installed-header flags/fh offsets and width assertions replace the old flags-only ABI prefix. The adapter requests atomic O_TRUNC and killpriv v1 when supported, disables killpriv v2, and supports kernel kill-bit metadata flags without enabling chmod/chown.
 - Resize uses `setattr`; shrinking trims/deletes discarded chunks and extension reads as zeros. `open` handles negotiated atomic O_TRUNC.
-- `src/store_tests.zig` and `src/runtime.zig` contain in-memory regression tests; `tests/lowlevel_smoke.py` is an explicitly authorized fresh-mount test that retains artifacts. It is not a general cleanup or isolation harness.
+- Zig component tests live in `tests/database_lock_test.zig`, `tests/store_test.zig`, and `tests/runtime_test.zig`; run all three with `zig build test`. `tests/lowlevel_smoke.py` remains a separate, explicitly authorized fresh-mount test that retains artifacts.
 - **Incomplete:** rmdir/rename, startup orphan recovery, embedded filesystem API, migrations, pjdfstest, durability validation, and a general cleanup runner. The mount cannot yet satisfy the full basic shell workflow.
 - The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
 
@@ -216,6 +216,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Read-only subagent audits caught stale saved append flags and an over-broad MODE privilege-clearing exception during implementation; both were corrected and covered by tests. Final audit found no concrete must-fix issues. Rollback failures/uncertain connection state remain existing hardening work; no POSIX/durability claim follows from these checks.
 - Added `docs/INODE_MODES.md` at user request; checked schema/code constants and project limitations, with a read-only subagent fact check. Documentation only; no mounts or runtime tests were performed.
 - Completed regular-file unlink and session-local reclamation. Debug and ReleaseSafe builds, formatting, and all 15 tests passed using a fresh Zig cache (the existing cache contained a malformed generated C binding). In-memory coverage includes multiple names, link-count consistency, inode identity after name reuse, and transaction/reclamation rollback and retry. The explicitly authorized fresh unprivileged smoke test passed: `rm`, missing name and directory rejection, multiple opens and `dup`, `O_PATH` after attribute-cache expiry, open-after-unlink I/O and resize, name reuse, reclamation, and remount. Artifacts retained at `/tmp/zqueel-lowlevel-clyu_315`; no existing filesystem data used. No crash or privileged tests run.
+- Moved all 14 named Zig tests into three component suites under `tests/`; the former anonymous runtime import block was replaced by a standalone suite. Formatting, the Debug executable build, and all 14 tests in Debug and ReleaseSafe passed. No mount test was run for this reorganization.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)

@@ -1,6 +1,6 @@
 const std = @import("std");
 const c = @import("ffi");
-const fs = @import("store.zig");
+const fs = @import("store");
 
 fn sql(statement: [*:0]const u8) !void {
     if (c.sqlite3_exec(fs.database, statement, null, null, null) != c.SQLITE_OK) {
@@ -33,10 +33,6 @@ fn scalar(statement: [*:0]const u8) !i64 {
     defer _ = c.sqlite3_finalize(stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     return c.sqlite3_column_int64(stmt, 0);
-}
-
-test {
-    _ = @import("runtime.zig");
 }
 
 test "root mapping, byte names, child lookup, dot and dotdot" {
