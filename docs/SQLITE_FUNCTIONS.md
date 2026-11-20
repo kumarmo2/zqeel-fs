@@ -1,6 +1,6 @@
 # SQLite functions used by zqueel-fs
 
-This is a guide to the SQLite C API calls currently used by `src/main.zig` and `src/mount.zig`. Zig accesses them through the translated declarations in `src/ffi.h`. It describes what the code does today, not a promise of complete error handling or production readiness. Consult the [SQLite C API reference](https://www.sqlite.org/c3ref/intro.html) for the full contracts.
+This is a guide to the SQLite C API calls currently used by `src/main.zig`, `src/mount.zig`, and the inode-based operations in `src/store.zig` (excluding test-only helpers). Zig accesses them through the translated declarations in `src/ffi.h`. It describes what the code does today, not a promise of complete error handling or production readiness. Consult the [SQLite C API reference](https://www.sqlite.org/c3ref/intro.html) for the full contracts.
 
 The names below are C functions. SQLite types (`sqlite3`, `sqlite3_stmt`) and constants such as `SQLITE_OK` are not functions. The SQL function `last_insert_rowid()` is covered separately at the end.
 
@@ -38,7 +38,7 @@ Returns a human-readable message for the connection's most recent error. SQLite 
 
 ### `sqlite3_errcode`
 
-Returns the connection's most recent error code. `src/mount.zig` maps selected SQLite errors to filesystem errno values, masking to the primary code. Read the error promptly: later SQLite calls can change the connection's error state. See [`sqlite3_errcode`](https://www.sqlite.org/c3ref/errcode.html).
+Returns the connection's most recent error code. `src/store.zig` maps selected SQLite errors to filesystem errno values, masking to the primary code. Read the error promptly: later SQLite calls can change the connection's error state. See [`sqlite3_errcode`](https://www.sqlite.org/c3ref/errcode.html).
 
 ## Prepared statements and parameters
 
@@ -85,6 +85,10 @@ Read a column from the current result row as a 32-bit or signed 64-bit integer. 
 `sqlite3_column_blob` provides a pointer to the current column's BLOB bytes; `sqlite3_column_bytes` provides its length in bytes. The mount uses these for names and file chunks. SQLite owns the memory: do not free it, and copy it before stepping, resetting or finalizing the statement, or performing a conversion that invalidates the pointer.
 
 A null pointer can represent SQL `NULL` or a zero-length BLOB, not only an allocation failure. A zero byte count also does not distinguish those cases. See [result-column access and pointer lifetimes](https://www.sqlite.org/c3ref/column_blob.html).
+
+### `sqlite3_changes`
+
+Returns the number of rows directly inserted, updated, or deleted by the most recent completed INSERT, UPDATE, or DELETE on the connection. Unlink checks the result after each single-row mutation to detect unexpected state; changes made by triggers are not counted. See [`sqlite3_changes`](https://www.sqlite.org/c3ref/changes.html).
 
 ## Inserted row identity
 

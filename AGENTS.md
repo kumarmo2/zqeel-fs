@@ -16,6 +16,8 @@
 
 ## Working rules
 
+- Always use braces for statement-style `if`/`else` branches, including single statements; value-selecting `if` expressions may remain inline.
+
 - Ask about meaningful unresolved design choices rather than treating proposals as approved requirements.
 - Use subagents for relevant independent work when a subagent tool is available; the user explicitly requested this. Do not claim delegation when no such tool is available.
 - Do not implement future work merely because it appears in the handoff checklist.
@@ -31,5 +33,7 @@
 - `schema.sql`: reviewable proposed v1 schema.
 - `docs/STATUS.md`: project bookkeeping and continuation notes, including the paused unlink/open-handle design discussion.
 - `docs/LINUX_FILESYSTEM_NOTES.md`: generic Linux concepts; illustrative designs are not implemented-feature claims.
-- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental FUSE callbacks; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
+- `src/main.zig`, `src/ffi.h`, `src/mount.zig`: formatter and experimental low-level FUSE adapter; file/directory creation, writes, truncation and timestamp updates are supported, while deletion and rename remain unimplemented.
+- `src/store.zig`: inode-based SQLite operations; `src/runtime.zig`: volatile handles, lookup/open references, and directory snapshot ownership. No persistent inode reclamation yet.
+- `tests/database_lock_test.zig`, `tests/store_test.zig`, `tests/runtime_test.zig`: component tests run by `zig build test`. `tests/lowlevel_smoke.py`: explicitly authorized unprivileged mount/unmount smoke test; retains fresh run artifacts.
 - `build.zig`, `build.zig.zon`: Zig 0.17 executable configuration with SQLite and libfuse3 linkage.

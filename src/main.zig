@@ -54,11 +54,15 @@ fn format(path: [:0]const u8) !void {
     try exec(db, ddl.ptr);
 
     var ts: c.struct_timespec = undefined;
-    if (c.clock_gettime(c.CLOCK_REALTIME, &ts) != 0) return error.Clock;
+    if (c.clock_gettime(c.CLOCK_REALTIME, &ts) != 0) {
+        return error.Clock;
+    }
     const timestamp = std.math.add(i64, try std.math.mul(i64, ts.tv_sec, 1_000_000_000), ts.tv_nsec) catch return error.Clock;
     var stmt: ?*c.sqlite3_stmt = null;
     const root_sql = "INSERT INTO inodes(mode,uid,gid,nlink,size,atime_ns,mtime_ns,ctime_ns) VALUES(?, ?, ?, 2, 0, ?, ?, ?)";
-    if (c.sqlite3_prepare_v2(db, root_sql, -1, &stmt, null) != c.SQLITE_OK) return error.Sqlite;
+    if (c.sqlite3_prepare_v2(db, root_sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return error.Sqlite;
+    }
     const s = stmt orelse return error.Sqlite;
     defer _ = c.sqlite3_finalize(s);
     if (c.sqlite3_bind_int(s, 1, 0o40755) != c.SQLITE_OK or
@@ -67,7 +71,10 @@ fn format(path: [:0]const u8) !void {
         c.sqlite3_bind_int64(s, 4, timestamp) != c.SQLITE_OK or
         c.sqlite3_bind_int64(s, 5, timestamp) != c.SQLITE_OK or
         c.sqlite3_bind_int64(s, 6, timestamp) != c.SQLITE_OK or
-        c.sqlite3_step(s) != c.SQLITE_DONE) return error.Sqlite;
+        c.sqlite3_step(s) != c.SQLITE_DONE)
+    {
+        return error.Sqlite;
+    }
     try exec(db, "INSERT INTO fs_meta VALUES(1, 1, last_insert_rowid(), 65536);");
     try exec(db, "COMMIT;");
     std.debug.print("Formatted new filesystem database: {s}\n", .{path});
