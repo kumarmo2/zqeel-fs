@@ -8,7 +8,7 @@ const allocator = std.heap.page_allocator;
 // Single-threaded session; SQLite and runtime state stay alive through teardown.
 var live: runtime.Runtime = undefined;
 // Only inodes whose last name was removed by this session belong here.
-var pending_reclaims: std.AutoHashMap(i64, void) = undefined;
+var pending_reclaims: std.AutoHashMap(i64, store.RemovalKind) = undefined;
 
 // translate-c treats fuse_file_info as opaque because it contains C bitfields.
 // Locate a scalar field by its header-derived byte offset and return a pointer
@@ -354,6 +354,9 @@ fn snapshot(id: i64, out: *[]runtime.DirEntry) c_int {
     if ((n.mode & 0xf000) != 0x4000) {
         return -c.ENOTDIR;
     }
+    if (n.links == 0) {
+        return -c.ENOENT;
+    }
     var parent: store.Node = undefined;
     const rc = store.findChild(id, "..", &parent);
     if (rc != 0) {
@@ -436,6 +439,12 @@ fn readdir(req: c.fuse_req_t, ino: c.fuse_ino_t, size: usize, off: c.off_t, fi: 
         replyStatus(req, -c.EINVAL);
         return;
     }
+    // The open snapshot belongs to the old directory, not a replacement
+    // with the same name. Once detached it behaves as end-of-directory.
+    if (pending_reclaims.get(id) == .directory) {
+        _ = c.fuse_reply_buf(req, null, 0);
+        return;
+    }
     const buf = allocator.alloc(u8, size) catch {
         replyStatus(req, -c.ENOMEM);
         return;
@@ -460,18 +469,34 @@ fn unlink(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(
     if (builtin.mode == .debug) {
         std.debug.print("[fuse] unlink parent={d} name=\"{s}\"\n", .{ parent, name_slice });
     }
+    removeName(req, parent, name_slice, .file);
+}
+
+fn rmdir(req: c.fuse_req_t, parent: c.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
+    const name_slice = std.mem.span(name);
+    if (builtin.mode == .debug) {
+        std.debug.print("[fuse] rmdir parent={d} name=\"{s}\"\n", .{ parent, name_slice });
+    }
+    removeName(req, parent, name_slice, .directory);
+}
+
+fn removeName(req: c.fuse_req_t, parent: c.fuse_ino_t, name: []const u8, kind: store.RemovalKind) void {
     const id = dbInode(req, parent) orelse return;
-    // A committed unlink must be trackable even if later allocations fail.
+    // A committed removal must be trackable even if later allocations fail.
     pending_reclaims.ensureUnusedCapacity(1) catch {
         replyStatus(req, -c.ENOMEM);
         return;
     };
-    const deferred = store.unlinkName(id, name_slice, hasReferences) catch |err| {
+    const removal = switch (kind) {
+        .file => store.unlinkName(id, name, hasReferences),
+        .directory => store.rmdirName(id, name, hasReferences),
+    };
+    const deferred = removal catch |err| {
         replyStatus(req, unlinkErrno(err));
         return;
     };
     if (deferred) |target| {
-        pending_reclaims.putAssumeCapacity(target, {});
+        pending_reclaims.putAssumeCapacity(target, kind);
     }
     replyStatus(req, 0);
 }
@@ -481,6 +506,7 @@ fn unlinkErrno(err: store.UnlinkError) c_int {
         error.NotFound => c.ENOENT,
         error.NotDirectory => c.ENOTDIR,
         error.IsDirectory => c.EISDIR,
+        error.NotEmpty => c.ENOTEMPTY,
         error.InvalidName => c.EINVAL,
         error.NameTooLong => c.ENAMETOOLONG,
         error.Busy => c.EBUSY,
@@ -498,13 +524,14 @@ fn hasReferences(id: i64) bool {
 }
 
 fn tryReclaim(id: i64) void {
-    if (pending_reclaims.contains(id) and !hasReferences(id) and reclaim(id)) {
+    const kind = pending_reclaims.get(id) orelse return;
+    if (!hasReferences(id) and reclaim(id, kind)) {
         _ = pending_reclaims.remove(id);
     }
 }
 
-fn reclaim(id: i64) bool {
-    store.reclaimUnlinkedFile(id) catch |err| {
+fn reclaim(id: i64, kind: store.RemovalKind) bool {
+    store.reclaimUnlinked(id, kind) catch |err| {
         std.debug.print("FUSE could not reclaim unlinked inode {d}: {s}\n", .{ id, @errorName(err) });
         return false;
     };
@@ -515,9 +542,9 @@ fn reclaimAfterSession() bool {
     // The session is gone. The kernel may not have delivered all releases or
     // forgets. Retry only inodes recorded by this session, never old orphans.
     var ok = true;
-    var it = pending_reclaims.keyIterator();
-    while (it.next()) |id| {
-        if (!reclaim(id.*)) {
+    var it = pending_reclaims.iterator();
+    while (it.next()) |pending| {
+        if (!reclaim(pending.key_ptr.*, pending.value_ptr.*)) {
             ok = false;
         }
     }
@@ -595,6 +622,7 @@ fn runSession(mountpoint: [:0]const u8) !void {
     ops.readdir = readdir;
     ops.releasedir = releasedir;
     ops.unlink = unlink;
+    ops.rmdir = rmdir;
 
     // Foreground, single-threaded: mountpoint is separate from session options.
     var argv = [_][*c]u8{ @constCast("zqueel-fs"), @constCast("-o"), @constCast("default_permissions") };
