@@ -11,7 +11,7 @@
 - `src/ffi.h` exports installed-header offsets for flags and fh, with width assertions; Zig accesses those scalar fields without guessing the opaque bitfield layout. The `field` helper in `src/mount.zig` now has a short explanation of byte offsets, alignment, and caller obligations. Write requests use current request flags (verified against libfuse 3.18.3 dispatch and fcntl/mmap smoke tests), not stale open-time flags.
 - On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
-- pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
+- The first unprivileged pjdfstest pilot passed: 7 unchanged upstream scripts, 36 assertions. See [the test list and results](PJDFSTEST.md). The full and privileged suites have not been run.
 - The user requested the low-level refactor after the checkpoint. They selected **per-open directory snapshots** with stable index cookies, and authorized fresh unprivileged mount/unmount smoke tests with artifacts retained and no cleanup. Existing `temp-dir/` and databases remain untouched. Crash-orphan recovery policy remains unresolved.
 - Always use braces for statement-style if/else branches. Converted 79 unbraced branches across `src/main.zig`, `src/database_lock.zig`, and `src/mount.zig`; recorded the rule in `AGENTS.md`. Value-selecting if expressions remain inline; no behavior changes intended.
 - All registered low-level callbacks guard `[fuse]` stderr traces with `builtin.mode == .debug`; release builds omit them. Traces now identify inode IDs or parent/name pairs, not paths; file contents are never logged. Names are raw filesystem bytes, so logs need not be UTF-8. Preserve manual changes and do not commit or implement additional operations without a request.
@@ -62,7 +62,7 @@
 - Installed-header flags/fh offsets and width assertions replace the old flags-only ABI prefix. The adapter requests atomic O_TRUNC and killpriv v1 when supported, disables killpriv v2, and supports kernel kill-bit metadata flags without enabling chmod/chown.
 - Resize uses `setattr`; shrinking trims/deletes discarded chunks and extension reads as zeros. `open` handles negotiated atomic O_TRUNC.
 - Zig component tests live in `tests/database_lock_test.zig`, `tests/store_test.zig`, and `tests/runtime_test.zig`; run all three with `zig build test`. `tests/lowlevel_smoke.py` remains a separate, explicitly authorized fresh-mount test that retains artifacts.
-- **Incomplete:** rename, startup orphan recovery, embedded filesystem API, migrations, pjdfstest, durability validation, and a general cleanup runner. The mount cannot yet satisfy the full basic shell workflow.
+- **Incomplete:** rename, startup orphan recovery, embedded filesystem API, migrations, broader pjdfstest coverage, durability validation, and a general cleanup runner. The mount cannot yet satisfy the full basic shell workflow.
 - The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
 
 ## Operation tracking
@@ -95,7 +95,7 @@ Implemented means code exists, not that it is thoroughly tested or POSIX-complia
 | Other area | Status |
 |---|---|
 | Embedded Zig filesystem API | Pending |
-| pjdfstest and regression tests | In-memory tests and explicit fresh-mount smoke script implemented; pjdfstest pending |
+| pjdfstest and regression tests | In-memory tests, explicit fresh-mount smoke script, and a passing seven-script pjdfstest pilot |
 | Crash recovery, concurrent access, and durability validation | Pending |
 | Clean handling of Ctrl+C | Session signal handlers and teardown implemented; fresh-mount smoke passed |
 
@@ -220,6 +220,7 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Completed regular-file unlink and session-local reclamation. Debug and ReleaseSafe builds, formatting, and all 15 tests passed using a fresh Zig cache (the existing cache contained a malformed generated C binding). In-memory coverage includes multiple names, link-count consistency, inode identity after name reuse, and transaction/reclamation rollback and retry. The explicitly authorized fresh unprivileged smoke test passed: `rm`, missing name and directory rejection, multiple opens and `dup`, `O_PATH` after attribute-cache expiry, open-after-unlink I/O and resize, name reuse, reclamation, and remount. Artifacts retained at `/tmp/zqueel-lowlevel-clyu_315`; no existing filesystem data used. No crash or privileged tests run.
 - Moved all 14 named Zig tests into three component suites under `tests/`; the former anonymous runtime import block was replaced by a standalone suite. Formatting, the Debug executable build, and all 14 tests in Debug and ReleaseSafe passed. No mount test was run for this reorganization.
 - Implemented `rmdir`. Formatting, Debug and ReleaseSafe builds, and component tests passed (17 tests in ReleaseSafe; Debug reused cached lock/runtime results). New in-memory tests cover nonempty and invalid targets, link counts and timestamps, name reuse, creation rejection under detached directories, and rollback and reclamation retry. No mounts or runtime callback integration tests were run for rmdir.
+- With explicit authorization, ran the [pjdfstest pilot](PJDFSTEST.md) on a fresh unprivileged mount. All 36 assertions passed; supplemental nonempty and open-directory removal checks passed. Verified unmounted, with clean SQLite integrity/foreign-key checks and no remaining zero-link inodes. Artifacts retained at `/tmp/zqueel-pjdfstest-YdSv0CS9`; no sudo or existing database used.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)
