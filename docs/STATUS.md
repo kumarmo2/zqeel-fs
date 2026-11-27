@@ -3,15 +3,15 @@
 ## Resume here
 
 - Low-level FUSE migration is implemented on `feature/unlink` following checkpoint `8a4aa55` (`Add debug FUSE traces and document unlink design`); the user requested a commit and pull request for review. Existing file/directory operations have in-memory and authorized fresh-mount regression coverage.
-- Regular-file unlink and reclamation of files unlinked by the current session are implemented. **Rename, rmdir, hard-link creation, and startup orphan recovery remain unimplemented.**
+- Regular-file unlink, empty-directory rmdir, and reclamation of inodes removed by the current session are implemented. **Rename, hard-link creation, and startup orphan recovery remain unimplemented.**
 - `src/mount.zig` now registers `fuse_lowlevel_ops`, creates/mounts a session, and runs a single-threaded loop. Callbacks use inode IDs or parent/name pairs, not reconstructed paths.
 - `src/store.zig` contains inode-based SQLite operations; the root ID is swapped with 1 as necessary for collision-free FUSE_ROOT_ID mapping. `setattr` combines size/timestamp changes atomically; ordinary MODE/UID/GID changes are explicitly unsupported.
 - **TODO (user requested):** refactor `src/store.zig` to decouple its SQLite-backed operations from libfuse and move FUSE node-ID/root mapping and `FUSE_SET_ATTR_*` interpretation to the adapter. Consider Zig-native inputs and error unions instead of C-style output pointers/negative errno; translate POSIX/FUSE types and errors at the boundary while preserving specific SQLite error mapping. Design and implement only when requested.
-- `src/runtime.zig` tracks handle-ID-to-inode state and separate open/kernel lookup references. `open`/`create` populate `fi->fh`; `release`, `forget`, and `forget_multi` drop references and can reclaim zero-link files tracked by the current session. Shutdown retries outstanding reclamation after destroying the FUSE session and reports failure if cleanup still fails.
+- `src/runtime.zig` tracks handle-ID-to-inode state and separate open/kernel lookup references. `open`/`create` populate `fi->fh`; `release`, `releasedir`, `forget`, and `forget_multi` drop references and can reclaim zero-link inodes tracked by the current session. Shutdown retries outstanding reclamation after destroying the FUSE session and reports failure if cleanup still fails.
 - `src/ffi.h` exports installed-header offsets for flags and fh, with width assertions; Zig accesses those scalar fields without guessing the opaque bitfield layout. The `field` helper in `src/mount.zig` now has a short explanation of byte offsets, alignment, and caller obligations. Write requests use current request flags (verified against libfuse 3.18.3 dispatch and fcntl/mmap smoke tests), not stale open-time flags.
 - On `feature/database-locking`, format and mount hold a nonblocking exclusive advisory flock on the database inode until SQLite closes. This coordinates cooperating zqueel-fs instances on local filesystems; it does not prevent direct SQLite access or protect against pathname replacement. Do not implement orphan reclamation solely on the basis of this lock without addressing these limits.
 - The user wants generic Linux knowledge retained in `docs/LINUX_FILESYSTEM_NOTES.md`. Its symlink-target SQL is illustrative only; no symlink schema migration or callback has been implemented.
-- pjdfstest was explained but not integrated or run. Test scripts often require mkdir/unlink/rmdir/chmod/chown beyond their named category; review dependencies and FUSE credential access before running privileged tests.
+- The first unprivileged pjdfstest pilot passed: 7 unchanged upstream scripts, 36 assertions. See [the test list and results](PJDFSTEST.md). The full and privileged suites have not been run.
 - The user requested the low-level refactor after the checkpoint. They selected **per-open directory snapshots** with stable index cookies, and authorized fresh unprivileged mount/unmount smoke tests with artifacts retained and no cleanup. Existing `temp-dir/` and databases remain untouched. Crash-orphan recovery policy remains unresolved.
 - Always use braces for statement-style if/else branches. Converted 79 unbraced branches across `src/main.zig`, `src/database_lock.zig`, and `src/mount.zig`; recorded the rule in `AGENTS.md`. Value-selecting if expressions remain inline; no behavior changes intended.
 - All registered low-level callbacks guard `[fuse]` stderr traces with `builtin.mode == .debug`; release builds omit them. Traces now identify inode IDs or parent/name pairs, not paths; file contents are never logged. Names are raw filesystem bytes, so logs need not be UTF-8. Preserve manual changes and do not commit or implement additional operations without a request.
@@ -44,23 +44,25 @@
 - `docs/SQLITE_FUNCTIONS.md` documents the SQLite C API calls used by the current Zig sources and the SQL `last_insert_rowid()` function, including ownership and error-handling caveats.
 - `docs/FUSE_WORKFLOWS.md` compares current low-level and previous high-level workflows and summarizes callback reply functions versus lookup-reference accounting.
 - `docs/UNLINK.md` explains unlink steps, regular-file nlink versus runtime reference counts, the implemented transaction and reclamation behavior, and outstanding crash recovery.
+- `docs/RMDIR.md` explains empty-directory removal and how it shares unlink's lifetime rule.
 - `src/main.zig` implements `format <new-database>` and `mount <database> <mountpoint>`; `src/ffi.h` exposes SQLite/FUSE/POSIX APIs through Zig translate-c.
 - The formatter reserves a new file exclusively, locks it, initializes schema and root in one SQLite transaction, and refuses an existing path.
 - `src/database_lock.zig` acquires a nonblocking exclusive flock using `std.os.linux.flock`; format and mount hold its close-on-exec descriptor until after SQLite closes. Contention reports `DatabaseInUse`; EINTR currently reports `DatabaseLock` without retry. Future embedded access must follow the same protocol.
 - Locking is advisory, assumes a stable database pathname and cooperating processes, and is intended for local filesystems. Direct SQLite users and file replacement can bypass it; network filesystem behavior is not guaranteed. Orphan recovery is not implemented.
 - Formatting selects format version 1, a 64 KiB chunk size, root mode 0755, and the formatter's effective uid/gid.
 - `build.zig` links SQLite and libfuse3 and embeds the reviewed schema.
-- `src/mount.zig` implements an experimental, foreground, single-threaded low-level FUSE adapter with init, lookup/forget/forget_multi, getattr/setattr, open/create/release, mkdir, unlink, read/write, and opendir/readdir/releasedir. Single-threaded execution, default_permissions, kernel-applied umask, disabled writeback caching, and daemon-enforced append are preserved.
+- `src/mount.zig` implements an experimental, foreground, single-threaded low-level FUSE adapter with init, lookup/forget/forget_multi, getattr/setattr, open/create/release, mkdir, unlink, rmdir, read/write, and opendir/readdir/releasedir. Single-threaded execution, default_permissions, kernel-applied umask, disabled writeback caching, and daemon-enforced append are preserved.
 - `src/store.zig` reuses the chunk algorithms behind inode-based operations; directory handles own immutable snapshots. `src/runtime.zig` owns volatile handles and reference counts; teardown frees remaining runtime state without assuming final release/forget messages.
 - File creation and mkdir share an atomic inode/dirent insertion helper with parent mtime/ctime updates and FUSE credentials.
 - `store.unlinkName` removes one entry, verifies the remaining hard-link count, and updates target ctime and parent mtime/ctime in one transaction. The adapter preserves referenced zero-link files; reclaiming a file deletes chunks before the inode. The schema is unchanged.
+- `store.rmdirName` checks live entries for emptiness and atomically removes the name, sets the target link count to zero, and decrements the parent's link count. A retained directory cannot receive new entries, and reads on its open directory handle return EOF. Reclamation shares unlink's reference checks and does not delete file chunks. No schema change.
 - mkdir starts directories with nlink=2, increments parent nlink, and inherits gid/setgid from a setgid parent; the kernel applies umask.
 - Timestamp changes now use low-level `setattr`, including explicit times, NOW flags and omitted fields. Combined size/timestamp requests use one transaction; explicit times override resize defaults. No-op requests do not bump ctime.
 - `write` updates affected chunks, size, mtime and ctime in one SQLite transaction, supports append and sparse gaps, and clears setuid/setgid bits.
 - Installed-header flags/fh offsets and width assertions replace the old flags-only ABI prefix. The adapter requests atomic O_TRUNC and killpriv v1 when supported, disables killpriv v2, and supports kernel kill-bit metadata flags without enabling chmod/chown.
 - Resize uses `setattr`; shrinking trims/deletes discarded chunks and extension reads as zeros. `open` handles negotiated atomic O_TRUNC.
 - Zig component tests live in `tests/database_lock_test.zig`, `tests/store_test.zig`, and `tests/runtime_test.zig`; run all three with `zig build test`. `tests/lowlevel_smoke.py` remains a separate, explicitly authorized fresh-mount test that retains artifacts.
-- **Incomplete:** rmdir/rename, startup orphan recovery, embedded filesystem API, migrations, pjdfstest, durability validation, and a general cleanup runner. The mount cannot yet satisfy the full basic shell workflow.
+- **Incomplete:** rename, startup orphan recovery, embedded filesystem API, migrations, broader pjdfstest coverage, durability validation, and a general cleanup runner. The mount cannot yet satisfy the full basic shell workflow.
 - The mount opens SQLite read-write with foreign keys enabled and uses FUSE `default_permissions`; never use this preliminary code for production or concurrently modify its database.
 
 ## Operation tracking
@@ -82,18 +84,18 @@ Implemented means code exists, not that it is thoroughly tested or POSIX-complia
 | Resize a file | `setattr` (SIZE), `open` (O_TRUNC) | `truncate -s 100 file`, `echo text > existing-file` | Basic implementation; shrinking discards data and extension reads as zero |
 | Delete a file | `unlink` | `rm file` | Implemented for regular files; open descriptors remain usable after unlink |
 | Create a directory | `mkdir` | `mkdir dir`, `mkdir -p a/b` | Basic implementation; atomic creation, parent link counts/timestamps and setgid inheritance |
-| Remove an empty directory | `rmdir` | `rmdir dir` | Pending |
+| Remove an empty directory | `rmdir` | `rmdir dir` | Implemented; nonempty directories are refused |
 | Rename or move | `rename` | `mv old new` | Pending |
 | Change permissions or owner | `chmod`, `chown` | `chmod 600 file` | Pending |
 | Change timestamps | `setattr` (time flags) | `touch -t ... file` | Basic implementation; explicit times, now/omit, and ctime updates |
 | Create links | `link`, `symlink`, `readlink` | `ln`, `ln -s` | Pending; phase-1 scope not decided |
 | Sync data | `fsync`, `fsyncdir` | `fsync(2)` | Pending; durability contract also needs definition |
-| Open-handle lifecycle | `open`/`create`, `release`, `forget` | Track live file instances and kernel references | Implemented; zero-link files remain until their open and lookup references are gone |
+| Open-handle lifecycle | `open`/`create`, `release`, `forget` | Track live file/directory instances and kernel references | Implemented; zero-link inodes remain until their open and lookup references are gone |
 
 | Other area | Status |
 |---|---|
 | Embedded Zig filesystem API | Pending |
-| pjdfstest and regression tests | In-memory tests and explicit fresh-mount smoke script implemented; pjdfstest pending |
+| pjdfstest and regression tests | In-memory tests, explicit fresh-mount smoke script, and a passing seven-script pjdfstest pilot |
 | Crash recovery, concurrent access, and durability validation | Pending |
 | Clean handling of Ctrl+C | Session signal handlers and teardown implemented; fresh-mount smoke passed |
 
@@ -217,11 +219,13 @@ Enforce cross-row rules in the same transaction as the operation; foreign keys a
 - Added `docs/INODE_MODES.md` at user request; checked schema/code constants and project limitations, with a read-only subagent fact check. Documentation only; no mounts or runtime tests were performed.
 - Completed regular-file unlink and session-local reclamation. Debug and ReleaseSafe builds, formatting, and all 15 tests passed using a fresh Zig cache (the existing cache contained a malformed generated C binding). In-memory coverage includes multiple names, link-count consistency, inode identity after name reuse, and transaction/reclamation rollback and retry. The explicitly authorized fresh unprivileged smoke test passed: `rm`, missing name and directory rejection, multiple opens and `dup`, `O_PATH` after attribute-cache expiry, open-after-unlink I/O and resize, name reuse, reclamation, and remount. Artifacts retained at `/tmp/zqueel-lowlevel-clyu_315`; no existing filesystem data used. No crash or privileged tests run.
 - Moved all 14 named Zig tests into three component suites under `tests/`; the former anonymous runtime import block was replaced by a standalone suite. Formatting, the Debug executable build, and all 14 tests in Debug and ReleaseSafe passed. No mount test was run for this reorganization.
+- Implemented `rmdir`. Formatting, Debug and ReleaseSafe builds, and component tests passed (17 tests in ReleaseSafe; Debug reused cached lock/runtime results). New in-memory tests cover nonempty and invalid targets, link counts and timestamps, name reuse, creation rejection under detached directories, and rollback and reclamation retry. No mounts or runtime callback integration tests were run for rmdir.
+- With explicit authorization, ran the [pjdfstest pilot](PJDFSTEST.md) on a fresh unprivileged mount. All 36 assertions passed; supplemental nonempty and open-directory removal checks passed. Verified unmounted, with clean SQLite integrity/foreign-key checks and no remaining zero-link inodes. Artifacts retained at `/tmp/zqueel-pjdfstest-YdSv0CS9`; no sudo or existing database used.
 - These checks do not establish POSIX semantics, durability, security against hostile pathname replacement, or cross-row invariants.
 
 ## Suggested next work (only when requested)
 
 1. Review unlink and its regression coverage. Resolve crash-orphan recovery policy before implementing automatic reclamation on startup.
-2. Add rmdir/rename and the shared embedded core only when requested; define synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
+2. Add rename and the shared embedded core only when requested; define synchronization, error mapping, permissions and crash/recovery behavior before relying on the filesystem.
 3. Use `tests/lowlevel_smoke.py` for explicitly authorized fresh-mount regressions; it retains artifacts. Authorization for this migration's runs does not authorize privileged suites, crash tests, or destructive cleanup.
 4. Add safe per-run test lifecycle and applicable pjdfstest cases when requested.

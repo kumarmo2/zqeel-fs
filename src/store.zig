@@ -97,6 +97,9 @@ pub fn findChild(parent_id: i64, name: []const u8, found: *Node) c_int {
     if ((parent.mode & 0xf000) != 0x4000) {
         return -c.ENOTDIR;
     }
+    if (parent.links == 0) {
+        return -c.ENOENT;
+    }
     if (std.mem.eql(u8, name, ".")) {
         found.* = parent;
         return 0;
@@ -147,6 +150,7 @@ pub const UnlinkError = error{
     NotFound,
     NotDirectory,
     IsDirectory,
+    NotEmpty,
     InvalidName,
     NameTooLong,
     Busy,
@@ -172,10 +176,20 @@ fn unlinkError(status: c_int) UnlinkError {
     };
 }
 
+pub const RemovalKind = enum { file, directory };
+
+pub fn unlinkName(parent_id: i64, name: []const u8, hasReferences: *const fn (i64) bool) UnlinkError!?i64 {
+    return removeName(parent_id, name, .file, hasReferences);
+}
+
+pub fn rmdirName(parent_id: i64, name: []const u8, hasReferences: *const fn (i64) bool) UnlinkError!?i64 {
+    return removeName(parent_id, name, .directory, hasReferences);
+}
+
 // Remove one name atomically. Return a zero-link inode ID only if the caller
 // still has references to it. The predicate must not mutate the database or
 // runtime references; the single-threaded caller keeps that state stable.
-pub fn unlinkName(parent_id: i64, name: []const u8, hasReferences: *const fn (i64) bool) UnlinkError!?i64 {
+fn removeName(parent_id: i64, name: []const u8, kind: RemovalKind, hasReferences: *const fn (i64) bool) UnlinkError!?i64 {
     const valid = validateName(name);
     if (valid != 0) {
         return unlinkError(valid);
@@ -190,11 +204,32 @@ pub fn unlinkName(parent_id: i64, name: []const u8, hasReferences: *const fn (i6
     if (found != 0) {
         return unlinkError(found);
     }
-    if ((target.mode & inode_mode_mask) == c.S_IFDIR) {
-        return error.IsDirectory;
-    }
-    if (!target.is_file() or target.id == root or target.links <= 0) {
-        return error.Io;
+    const directory = kind == .directory;
+    if (directory) {
+        if ((target.mode & inode_mode_mask) != c.S_IFDIR) {
+            return error.NotDirectory;
+        }
+        if (target.id == root) {
+            return error.Busy;
+        }
+        const children = prepare("SELECT 1 FROM dirents WHERE parent_inode=? LIMIT 1") orelse return unlinkError(sqliteError());
+        defer _ = c.sqlite3_finalize(children);
+        try bindIntegers(children, &.{target.id});
+        switch (c.sqlite3_step(children)) {
+            c.SQLITE_ROW => return error.NotEmpty,
+            c.SQLITE_DONE => {},
+            else => return unlinkError(sqliteError()),
+        }
+        if (target.links != 2) {
+            return error.Io;
+        }
+    } else {
+        if ((target.mode & inode_mode_mask) == c.S_IFDIR) {
+            return error.IsDirectory;
+        }
+        if (!target.is_file() or target.id == root or target.links <= 0) {
+            return error.Io;
+        }
     }
     const now = nowNs() orelse return error.Io;
 
@@ -208,24 +243,29 @@ pub fn unlinkName(parent_id: i64, name: []const u8, hasReferences: *const fn (i6
     }
     try changeOne(remove);
 
-    // The reverse index supports checking remaining names. A mismatched
-    // count must not leave behind a nameless inode with a positive nlink.
-    const update = prepare("UPDATE inodes SET nlink=nlink-1,ctime_ns=? WHERE inode_id=? AND nlink=? AND nlink-1=(SELECT count(*) FROM dirents WHERE target_inode=inodes.inode_id)") orelse return unlinkError(sqliteError());
+    // An empty directory loses both of its links. For a file, remove just
+    // one. In either case, verify that the remaining names agree.
+    const remaining = if (directory) 0 else target.links - 1;
+    const update = prepare("UPDATE inodes SET nlink=?1,ctime_ns=?2 WHERE inode_id=?3 AND nlink=?4 AND ?1=(SELECT count(*) FROM dirents WHERE target_inode=inodes.inode_id)") orelse return unlinkError(sqliteError());
     defer _ = c.sqlite3_finalize(update);
-    try bindIntegers(update, &.{ now, target.id, target.links });
+    try bindIntegers(update, &.{ remaining, now, target.id, target.links });
     try changeOne(update);
 
-    const parent = prepare("UPDATE inodes SET mtime_ns=?,ctime_ns=? WHERE inode_id=?") orelse return unlinkError(sqliteError());
+    const parent_sql = if (directory)
+        "UPDATE inodes SET nlink=nlink-1,mtime_ns=?,ctime_ns=? WHERE inode_id=? AND nlink>2"
+    else
+        "UPDATE inodes SET mtime_ns=?,ctime_ns=? WHERE inode_id=?";
+    const parent = prepare(parent_sql) orelse return unlinkError(sqliteError());
     defer _ = c.sqlite3_finalize(parent);
     try bindIntegers(parent, &.{ now, now, parent_id });
     try changeOne(parent);
 
     var deferred: ?i64 = null;
-    if (target.links == 1) {
+    if (remaining == 0) {
         if (hasReferences(target.id)) {
             deferred = target.id;
         } else {
-            try deleteUnlinkedFile(target.id);
+            try deleteUnlinked(target.id, kind);
         }
     }
     if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) {
@@ -270,13 +310,30 @@ fn deleteUnlinkedFile(id: i64) UnlinkError!void {
     try changeOne(inode);
 }
 
-// Used only for zero-link files recorded by the current mount, not startup recovery.
+fn deleteUnlinked(id: i64, kind: RemovalKind) UnlinkError!void {
+    if (kind == .file) {
+        return deleteUnlinkedFile(id);
+    }
+    if (id == root) {
+        return error.Io;
+    }
+    const inode = prepare("DELETE FROM inodes WHERE inode_id=? AND nlink=0 AND (mode & ?)=? AND NOT EXISTS(SELECT 1 FROM dirents WHERE target_inode=inodes.inode_id) AND NOT EXISTS(SELECT 1 FROM dirents WHERE parent_inode=inodes.inode_id) AND NOT EXISTS(SELECT 1 FROM file_chunks WHERE inode_id=inodes.inode_id)") orelse return unlinkError(sqliteError());
+    defer _ = c.sqlite3_finalize(inode);
+    try bindIntegers(inode, &.{ id, inode_mode_mask, c.S_IFDIR });
+    try changeOne(inode);
+}
+
 pub fn reclaimUnlinkedFile(id: i64) UnlinkError!void {
+    return reclaimUnlinked(id, .file);
+}
+
+// Used only for zero-link inodes recorded by the current mount, not startup recovery.
+pub fn reclaimUnlinked(id: i64, kind: RemovalKind) UnlinkError!void {
     if (c.sqlite3_exec(database, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
         return unlinkError(sqliteError());
     }
     errdefer _ = c.sqlite3_exec(database, "ROLLBACK", null, null, null);
-    try deleteUnlinkedFile(id);
+    try deleteUnlinked(id, kind);
     if (c.sqlite3_exec(database, "COMMIT", null, null, null) != c.SQLITE_OK) {
         return unlinkError(sqliteError());
     }
@@ -455,6 +512,9 @@ pub fn createNode(parent_id: i64, name: []const u8, mode: c.mode_t, directory: b
     const parent = node(parent_id) catch |err| return nodeError(err);
     if ((parent.mode & 0xf000) != 0x4000) {
         return -c.ENOTDIR;
+    }
+    if (parent.links == 0) {
+        return -c.ENOENT;
     }
     const existing = prepare("SELECT 1 FROM dirents WHERE parent_inode=? AND name=?") orelse return sqliteError();
     defer _ = c.sqlite3_finalize(existing);

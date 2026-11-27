@@ -1,6 +1,6 @@
 # Unlink: steps, nlink, and inode lifetime
 
-**Status:** regular-file unlink and reclamation of files unlinked by the current mount are implemented. Startup orphan recovery, `rmdir`, and hard-link creation remain unimplemented.
+**Status:** regular-file unlink and reclamation of files unlinked by the current mount are implemented. Startup orphan recovery and hard-link creation remain unimplemented. Empty directories are handled separately by [`rmdir`](RMDIR.md).
 
 ## 1. What unlink removes
 

@@ -263,6 +263,88 @@ test "unlink and deferred reclamation roll back on failure" {
     try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM file_chunks"));
 }
 
+test "rmdir refuses files and directories with current entries" {
+    try setup();
+    defer teardown();
+    var dir: fs.Node = undefined;
+    var child: fs.Node = undefined;
+    try std.testing.expectError(error.NotFound, fs.rmdirName(10, "missing", noReferences));
+    try std.testing.expectError(error.NotDirectory, fs.rmdirName(10, "x", noReferences));
+    try std.testing.expectError(error.InvalidName, fs.rmdirName(10, ".", noReferences));
+    try std.testing.expectError(error.InvalidName, fs.rmdirName(10, "..", noReferences));
+    try sql("INSERT INTO dirents VALUES(10,x'726f6f74',10);"); // Invalid alias to exercise the root guard.
+    try std.testing.expectError(error.Busy, fs.rmdirName(10, "root", noReferences));
+    try sql("DELETE FROM dirents WHERE target_inode=10;");
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "dir", 0o755, true, 100, 200, &dir));
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(dir.id, ".hidden", 0o600, false, 100, 200, &child));
+    const before = try fs.node(dir.id);
+    const parent = try fs.node(10);
+    try std.testing.expectError(error.NotEmpty, fs.rmdirName(10, "dir", noReferences));
+    try std.testing.expectEqualDeep(before, try fs.node(dir.id));
+    try std.testing.expectEqualDeep(parent, try fs.node(10));
+    try std.testing.expectEqual(@as(?i64, null), try fs.unlinkName(dir.id, ".hidden", noReferences));
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(dir.id, "sub", 0o755, true, 100, 200, &child));
+    try std.testing.expectError(error.NotEmpty, fs.rmdirName(10, "dir", noReferences));
+    try std.testing.expectEqual(@as(?i64, null), try fs.rmdirName(dir.id, "sub", noReferences));
+    try std.testing.expectError(error.NotFound, fs.node(child.id));
+    try std.testing.expectEqual(@as(i64, 2), (try fs.node(dir.id)).links);
+    try std.testing.expectEqual(@as(?i64, null), try fs.rmdirName(10, "dir", noReferences));
+    try std.testing.expectError(error.NotFound, fs.node(dir.id));
+    try std.testing.expectEqual(@as(i64, 2), (try fs.node(10)).links);
+}
+
+test "rmdir detaches a referenced directory without redirecting it to a replacement" {
+    try setup();
+    defer teardown();
+    var dir: fs.Node = undefined;
+    var replacement: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "dir", 0o755, true, 100, 200, &dir));
+    try sql("UPDATE inodes SET ctime_ns=0,mtime_ns=0,atime_ns=0;");
+    try std.testing.expectEqual(@as(?i64, dir.id), try fs.rmdirName(10, "dir", hasReferences));
+    const removed = try fs.node(dir.id);
+    const parent = try fs.node(10);
+    try std.testing.expectEqual(@as(i64, 0), removed.links);
+    try std.testing.expectEqual(@as(i64, 0), removed.mtime);
+    try std.testing.expectEqual(@as(i64, 0), removed.atime);
+    try std.testing.expect(removed.ctime > 0);
+    try std.testing.expectEqual(removed.ctime, parent.ctime);
+    try std.testing.expectEqual(removed.ctime, parent.mtime);
+    try std.testing.expectEqual(@as(i64, 2), parent.links);
+    try std.testing.expectEqual(@as(c_int, -c.ENOENT), fs.findChild(10, "dir", &replacement));
+    try std.testing.expectEqual(@as(c_int, -c.ENOENT), fs.findChild(dir.id, "..", &replacement));
+    for ([_]bool{ false, true }) |directory| {
+        try std.testing.expectEqual(@as(c_int, -c.ENOENT), fs.createNode(dir.id, "child", 0o755, directory, 100, 200, &replacement));
+    }
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "dir", 0o755, true, 100, 200, &replacement));
+    try std.testing.expect(replacement.id != removed.id);
+    try fs.reclaimUnlinked(removed.id, .directory);
+    try std.testing.expectError(error.NotFound, fs.node(removed.id));
+    try std.testing.expectEqualDeep(replacement, try fs.node(replacement.id));
+    try std.testing.expectEqual(@as(i64, 0), try scalar("SELECT count(*) FROM pragma_foreign_key_check"));
+}
+
+test "rmdir and deferred directory reclamation roll back on failure" {
+    try setup();
+    defer teardown();
+    var dir: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), fs.createNode(10, "dir", 0o755, true, 100, 200, &dir));
+    const parent = try fs.node(10);
+    try sql("CREATE TRIGGER fail_parent BEFORE UPDATE ON inodes WHEN OLD.inode_id=10 BEGIN SELECT RAISE(ABORT,'injected'); END;");
+    try std.testing.expectError(error.Io, fs.rmdirName(10, "dir", noReferences));
+    try sql("DROP TRIGGER fail_parent; CREATE TRIGGER fail_delete BEFORE DELETE ON inodes BEGIN SELECT RAISE(ABORT,'injected'); END;");
+    try std.testing.expectError(error.Io, fs.rmdirName(10, "dir", noReferences));
+    var found: fs.Node = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), fs.findChild(10, "dir", &found));
+    try std.testing.expectEqualDeep(dir, found);
+    try std.testing.expectEqualDeep(parent, try fs.node(10));
+    try std.testing.expectEqual(@as(?i64, dir.id), try fs.rmdirName(10, "dir", hasReferences));
+    try std.testing.expectError(error.Io, fs.reclaimUnlinked(dir.id, .directory));
+    try std.testing.expectEqual(@as(i64, 0), (try fs.node(dir.id)).links);
+    try sql("DROP TRIGGER fail_delete;");
+    try fs.reclaimUnlinked(dir.id, .directory);
+    try std.testing.expectError(error.NotFound, fs.node(dir.id));
+}
+
 test "privilege stripping is supported without general chmod" {
     try setup();
     defer teardown();
